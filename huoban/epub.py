@@ -1349,9 +1349,10 @@ body {
        眼睛从行尾折回行首会找不到下一行。手机上 max-width 不生效。 */
     max-width: 40em;
     margin: 0 auto;
-    /* 章末留白：一章的最后一页不该让正文顶到屏幕最底边（贴着底边的那行
-       看着像"被切断了"，翻页时也分不清是不是还有下文）。 */
-    padding-bottom: 2.5em;
+    /* 这里**不写 padding / margin-bottom**。在把 body 盒子映射为页面框的分页
+       阅读器中，body 的 padding 会成为每页内边距，而不是整篇文档末尾的留白。
+       掌阅 Tango 2 Pro 实测，2.5em 的 padding-bottom 让每页 15 行只剩 13 行。
+       CSS 没有 :last-page 选择器，无法只给最后一页留白，因此不设这类声明。 */
 }
 
 /* 正文：2em 首行缩进是中文排版惯例；inter-ideograph 让两端对齐按字距伸缩，

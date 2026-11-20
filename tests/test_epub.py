@@ -1204,7 +1204,7 @@ def case_modified_string_and_invalid() -> None:
 
 
 def case_page_break_and_spacing() -> None:
-    """分页与留白：章标题另起一页、首个元素不重复分页、章末留白、目录卷行加粗。
+    """分页与留白：章标题另起一页、首个元素不重复分页、body 不设 padding、目录卷行加粗。
 
     为什么"首个元素不重复分页"要单独立一条：每章已经是独立的 xhtml 文件，
     多数阅读器会在 spine 项之间自动分页。若再对文档第一个 h1 声明
@@ -1229,8 +1229,13 @@ def case_page_break_and_spacing() -> None:
     # 卷标题页自己也是文档首个元素 —— 这条覆盖必须比 h1.vol 更具体才生效
     assert "h1.vol:first-child" in css
 
-    # 章末留白：正文最后一页不能顶着屏幕底边
-    assert "padding-bottom: 2.5em" in css, "章末要留白"
+    # body 上不许出现 padding：在把 body 盒子作为页面框的分页阅读器中，
+    # 它会成为每页内边距，而不是整篇文档末尾的留白。掌阅 Tango 2 Pro 实测：
+    # padding-bottom: 2.5em 让每页 15 行只能排 13 行。CSS 没有 :last-page，
+    # 无法只给最后一页留白，所以这里必须断言"没有"，而不是"有"。
+    body_rule = re.search(r"^body\s*\{(.*?)\}", css, re.M | re.S)
+    assert body_rule, "样式表里找不到 body 规则"
+    assert not re.search(r"(?m)^\s*padding(-[\w-]+)?\s*:", body_rule.group(1)), body_rule.group(1)
 
     # 目录：卷行加粗 + 上方留白（缩进只说明层级，加粗才看得出"这是卷"）
     assert "nav li.vol" in css

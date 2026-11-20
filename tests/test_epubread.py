@@ -1950,7 +1950,10 @@ def case_table_structure_kept() -> None:
             "OEBPS/content.opf": opf,
             "OEBPS/toc.ncx": ncx,
             "OEBPS/Text/ch1.xhtml": XHTML.format(
-                body="<h1>第一章 开端</h1><p>表前正文。</p>" + table
+                # 表前正文里给表格留一条链接：id 只有被指向才值得保留
+                # （_drop_unreferenced_anchors 会把没人指的死 id 清掉）。
+                body='<h1>第一章 开端</h1><p>表前正文，见<a epub:type="noteref" '
+                'href="#table-3">表三</a>。</p>' + table
                 + '<p id="n1">注释一。</p><p>表后正文。</p>'
             ),
         }
@@ -1990,8 +1993,65 @@ def case_table_structure_kept() -> None:
         assert para.text.splitlines()[0] == "年代｜重要事件", para.text
         assert para.text.splitlines()[1] == "1771｜恩萧先生去利物浦，带回弃儿希斯克利夫。", para.text
 
-        # 6) 表前正文仍保持独立；<caption> 的拆出由表题用例覆盖
-        assert ch.paragraphs[0].text == "表前正文。"
+        # 6) 表前正文仍保持独立；"表三"由 refs 承载，不重复写入 text。
+        #    <caption> 的拆出由表题用例覆盖。
+        assert ch.paragraphs[0].text == "表前正文，见。", ch.paragraphs[0].text
+        assert [r["label"] for r in ch.paragraphs[0].refs] == ["表三"], ch.paragraphs[0].refs
+
+
+def case_drop_unreferenced_anchors() -> None:
+    """原书带来的死 id 要在导入时清掉，但被保留 refs 指向的 id 一个都不能少。
+
+    真实来源：《嘯風山莊》里几乎每个段落外都套着 `<span id="kobo.12.3">`
+    （Kobo 记阅读位置用），版式容器上还挂着 book-columns。原书记录了 2563 个
+    未被保留 refs 指向的 id；合并分片章节后，同一文件里还会出现 3 个 kobo.2.1。
+    这些 id 既占正文体积，也会触发 EPUBCheck 的 RSC-005 重复 id。
+
+    判据必须是"有没有保留的 refs 指过来"，而不是 id 的命名形态：
+    注释段的 id 自己不带 href，但正文注码的 refs 指向它，就必须留。
+    """
+    body = (
+        '<h1>第一章 开端</h1>'
+        '<p><span id="kobo.1.1">正文一。</span></p>'
+        '<div id="book-columns"><p>正文二。</p></div>'
+        '<p><span id="kobo.2.1">正文三<a epub:type="noteref" href="#n1">[1]</a>。</span></p>'
+        '<p id="n1">注释一。</p>'
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        opf = _opf(
+            spine=["c1"],
+            manifest=[
+                ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        )
+        entries = {
+            "OEBPS/content.opf": opf,
+            "OEBPS/toc.ncx": _ncx(_navpoint("第一章 开端", "Text/ch1.xhtml")),
+            "OEBPS/Text/ch1.xhtml": XHTML.format(body=body),
+        }
+        got = read_epub_with_report(_epub(tmp, entries))
+        book, report = got.book, got.report
+        allp = [p for ch in book.chapters for p in ch.paragraphs]
+
+        # 1) 三个没人指的 id 全被清掉：两个 Kobo 位置标记 + 一个版式容器
+        assert not [p for p in allp if p.anchor.startswith("kobo.")], [p.anchor for p in allp]
+        assert not [p for p in allp if p.anchor == "book-columns"], [p.anchor for p in allp]
+        assert report["ids_dropped"] == 3, report["ids_dropped"]
+
+        # 2) 被注码指着的那个 id 必须留 —— 它是渲染 <a href="#n1"> 的落点
+        notes = [p for p in allp if p.kind == "note"]
+        assert [p.anchor for p in notes] == ["n1"], [(p.kind, p.anchor) for p in allp]
+        refs = [r for p in allp for r in p.refs]
+        assert [r["note"] for r in refs] == ["n1"], refs
+        assert refs[0]["label"] == "[1]" and refs[0]["at"] == 3, refs
+
+        # 3) 清 id 不许动正文一个字。注码不在 text 里：引用活着时显示文字由
+        #    refs 承载，渲染层在 at 处插回链接。
+        assert [p.text for p in allp] == ["正文一。", "正文二。", "正文三。", "注释一。"], [
+            p.text for p in allp
+        ]
 
 
 def case_table_caption_and_empty_rows() -> None:
@@ -2101,6 +2161,7 @@ def main() -> int:
         case_schema_v2_image_paragraph,
         case_self_roundtrip_kinds,
         case_table_structure_kept,
+        case_drop_unreferenced_anchors,
         case_table_caption_and_empty_rows,
         case_table_roundtrip,
         case_note_number_strip_only_foreign,

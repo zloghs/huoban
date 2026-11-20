@@ -1412,6 +1412,40 @@ def _finalize_refs(book) -> None:
                 ]
 
 
+def _drop_unreferenced_anchors(book) -> int:
+    """清除未被保留的段落或单元格 refs 指向的 id，返回清除条数。
+
+    Kobo 常在段落外套 `<span id="kobo.12.3">` 记录阅读位置，版式容器上还会
+    挂 `book-columns` 这类 id。一本 820 KB 的书能攒下 2500 多个：分片合并时，
+    按源文件重新编号的 id 会在同一文件里重复，触发 EPUBCheck 的 RSC-005；
+    这些 id 在样本正文中占 37 KB，压缩后也还有 9 KB。
+
+    判据是引用关系，不是 id 的命名或所在段类型。注释段的 id 自己不带 href，
+    但只要正文注码的 refs 指向它，就必须保留；未被保留 refs 指向的注释落点
+    则清除锚点。本项目生成的 nav/ncx 只指向文件，不在这里的保留判据内。
+    """
+    used: set[str] = set()
+    for para in _iter_paragraphs(book):
+        for ref in para.refs or []:
+            if isinstance(ref, dict) and ref.get("note"):
+                used.add(str(ref["note"]))
+        for cell in _iter_cells(para):
+            for ref in cell.get("refs") or []:
+                if isinstance(ref, dict) and ref.get("note"):
+                    used.add(str(ref["note"]))
+
+    dropped = 0
+    for para in _iter_paragraphs(book):
+        if para.anchor and para.anchor not in used:
+            para.anchor = ""
+            dropped += 1
+        for cell in _iter_cells(para):
+            if cell.get("anchor") and cell["anchor"] not in used:
+                cell["anchor"] = ""
+                dropped += 1
+    return dropped
+
+
 def _parse_doc(data: bytes) -> list[list]:
     parser = _DocParser()
     parser.feed(data.decode("utf-8", "replace"))
@@ -2084,6 +2118,10 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     )
     # 全书都解析完了，现在才有资格判"这个引用指向的注释到底在不在"。
     _finalize_refs(book)
+    # 引用裁完之后，反过来把没人指向的 id 清掉（Kobo 的 kobo.*、版式容器的
+    # book-columns 这类）。必须排在 _finalize_refs 之后：那一趟要按完整锚点
+    # 表判断引用是否还有落点，先删就分不清"落点不存在"和"落点被删了"。
+    ids_dropped = _drop_unreferenced_anchors(book)
 
     fonts = sum(
         1 for item in opf.items.values()
@@ -2122,6 +2160,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         "merged_pieces": pieces,
         "front_matter_entries": front_entries,
         "toc_dropped": toc_dropped,
+        # 原书带来、但未被保留 refs 指向的 id 条数（Kobo 的 kobo.*、容器 id）。
+        # 数值大只说明这类 id 较多，不能据此判断原书是否分片或由何种工具生成。
+        "ids_dropped": ids_dropped,
         "continuation_docs": continuation_docs,
         "generated_pages": generated_pages,
         "empty_chapters": sum(1 for ch in merged if not ch.paragraphs),

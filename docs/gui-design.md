@@ -1073,6 +1073,17 @@ JPEG 扫 SOF0/SOF2 段。GIF 同理（逻辑屏幕描述符 6–9 字节）。�
    所以渲染前先建"锚点 → 文件"表，逐文档生成相对链接（章节文件同在 `Text/`，
    用文件名即可）。全书都找不到落点时只留文字。
 
+**导入收尾：清理未被 `refs` 指向的 id。** Kobo / Calibre 出的书常在段落外套一层
+`<span id="kobo.12.3">`（记阅读位置用），版式容器上还可能挂着 `book-columns`。
+解析器会把这些 id 收为 `Paragraph.anchor`，一本 820 KB 的书能攒下 2500 多个。
+当前章节树只有 `refs` 消费锚点，本项目生成的 nav / ncx 也只指向文件，因此在
+`_finalize_refs()` 完成引用筛选后调用 `_drop_unreferenced_anchors()`，清除未被保留的
+`Paragraph.refs` 或单元格 `refs` 指向的锚点；已展平为普通文字的其他 `<a>` 不算保留依据。
+这样能避免合并分片时产生同文件重复 id（Kobo 按源文件重新编号，合并后 3 个
+`kobo.2.1` 会触发 EPUBCheck 的 RSC-005），样本正文也减少 37 KB。判据与 id 的命名无关：
+注释段的 id 自己不带 href，但只要正文注码的 `refs` 指向它，就必须保留。
+表格段自己的 id 也要渲到 `<table>` 上，否则"见表三"这类引用会在打包后落空。
+
 **为什么 note 段落渲成 `<p class="note">` 而不是 `<note>`**：`_ELEMENT_BY_KIND` 的第二项
 才是 class，tag 必须是合法 xhtml 元素。同一类错误曾出现在书名页短行上
 （渲成 `<front-title>`，回读时被当成行内文本吞进相邻段落，死灵之书回环 4505→4491 段），

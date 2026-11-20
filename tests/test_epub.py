@@ -1423,6 +1423,75 @@ def case_font_subset_includes_front_matter() -> None:
     assert "甲" in chars and "正" in chars and "文" in chars, "章节正文的字不能丢"
 
 
+def case_table_renders_as_table() -> None:
+    """table 段必须渲成真的 <table>，样式表里必须有表格规则。
+
+    两头都要管：只补 CSS 不保结构，表格在导入时就被拆成一列段落，样式没有
+    东西可套；只保结构不补 CSS，渲出来是一堆没有边线的裸文字。真实来源：
+    《嘯風山莊》重排后 4 张表都变成了一列段落。
+    """
+    rows = [
+        [{"text": "年代", "header": True}, {"text": "重要事件", "header": True}],
+        [{"text": "1771"}, {"text": "恩萧先生去利物浦。"}],
+        [{"text": "1817", "colspan": 2}, {"text": ""}],
+    ]
+    book = _book(_chapter("第一章", [
+        "表前正文。",
+        Paragraph(text="年代｜重要事件", kind="table", rows=rows),
+        "表后正文。",
+    ]))
+    result = _build(book)
+    root = _chapter_roots(result)[0]
+
+    # 1) 元素位置：表格是 body 的直接子元素，不是一串 <p>
+    assert _tags(root) == ["h1", "p", "table", "p"], _tags(root)
+    tables = root.findall(".//xhtml:table", NS)
+    assert len(tables) == 1, len(tables)
+    tbl = tables[0]
+    assert tbl.get("class") == "tbl", tbl.get("class")
+
+    # 2) 行列：3 个 tr、2 个 th、4 个 td（空单元格也要占位）
+    trs = tbl.findall("xhtml:tr", NS)
+    assert len(trs) == 3, len(trs)
+    ths = trs[0].findall("xhtml:th", NS)
+    assert ["".join(x.itertext()) for x in ths] == ["年代", "重要事件"], ths
+    assert len(trs[1].findall("xhtml:td", NS)) == 2
+    assert len(trs[2].findall("xhtml:td", NS)) == 2, "空单元格不能省，否则整行错位"
+
+    # 3) 跨列只写大于 1 的：colspan="1" 在部分 Kindle 引擎里会被当成合并
+    assert trs[2].findall("xhtml:td", NS)[0].get("colspan") == "2", trs[2][0].attrib
+    assert trs[1].findall("xhtml:td", NS)[0].get("colspan") is None
+
+    # 3b) 第一列全是短词（年代 / 编号）时加 nw 禁止折行：中文能在字间断行，
+    # 不加的话手机宽度下「年代」会竖排、「1771」会被掰成「177/1」
+    assert trs[0].findall("xhtml:th", NS)[0].get("class") == "nw", trs[0][0].attrib
+
+    # 3c) 第一列是整句时不加 nw —— 否则那一列被撑成一行，整张表横向溢出
+    wide = _book(_chapter("第二章", [
+        Paragraph(text="甲", kind="table", rows=[
+            [{"text": "梁实秋译本"}, {"text": "伍光建译本"}],
+            [{"text": "那声音是不可恕的，除非是你的颈子正在被割断。"}, {"text": "除非是有人来杀你。"}],
+        ]),
+    ]))
+    wide_root = _chapter_roots(_build(wide))[0]
+    wide_tds = wide_root.findall(".//xhtml:td", NS)
+    assert wide_tds and all(td.get("class") is None for td in wide_tds), [t.attrib for t in wide_tds]
+
+    # 4) 样式表里确实有表格规则 —— 缺了它，上面这些都只是一堆没边线的文字
+    css = _read(result, "OEBPS/Styles/main.css").decode("utf-8")
+    assert "table.tbl" in css, css[-400:]
+    assert "border-collapse" in css, css[-400:]
+
+    # 5) 空网格的表格段：跳过并给一条警告，不能让整本书打不出来
+    empty = _book(_chapter("第一章", [
+        "正文。",
+        Paragraph(text="", kind="table", rows=[]),
+    ]))
+    empty_result = _build(empty)
+    assert _tags(_chapter_roots(empty_result)[0]) == ["h1", "p"], _tags(_chapter_roots(empty_result)[0])
+    assert any("表格" in w for w in empty_result.warnings), empty_result.warnings
+
+
 def main() -> int:
     cases = [
         case_package_structure,
@@ -1474,6 +1543,7 @@ def main() -> int:
         case_back_cover_unusable_produces_no_page,
         # 用户反馈（2026-11-09）：诗词块行距 / 字体子集收前言
         case_verse_gap_absorbed,
+        case_table_renders_as_table,
         case_font_subset_includes_front_matter,
     ]
     failed = 0

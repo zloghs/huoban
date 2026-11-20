@@ -28,7 +28,7 @@
 
 四个子命令：`diagnose` 体检 / `clean` 清洗 / `epub` 打包 / `reflow` 导入，每个都能加 `--help` 看完整参数。
 
-产物默认都落在输入文件旁边：`clean` 与 `epub` 落到 `<书名>_clean/`，里面有 `book.json`（章节树）、`book.txt`（干净正文）、`clean-report.md`（清洗报告）、`book.epub`；加 `--azw3` 再多一个同名 `.azw3`。`reflow` 落到 `<书名>_reflow/`，里面是 `book.json` 与 `images/`——拆回来的是章节与图，字符级格式（字体、颜色、行内样式）会丢。
+产物默认都落在输入文件旁边：`clean` 与 `epub` 落到 `<书名>_clean/`，里面有 `book.json`（章节树）、`book.txt`（干净正文）、`clean-report.md`（清洗报告）、`book.epub`；加 `--azw3` 再多一个同名 `.azw3`。`reflow` 落到 `<书名>_reflow/`，里面是 `book.json` 与 `images/`——拆回来的是章节、表格与图，字符级格式（字体、颜色、行内样式）会丢。
 
 ### 可选依赖
 

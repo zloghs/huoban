@@ -1937,10 +1937,13 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
             if target and target.lower().endswith(IMAGE_EXTS):
                 img_refs[target] += 1
         for m in _ZY_NOTE_IMG_RE.finditer(text):
-            src = _IMG_SRC_RE.search(m.group(0))
-            if src is None:
+            # 变量名别用 src：_import 的入参也叫 src（源文件路径），覆盖之后
+            # 报告里的来源会变成一个 re.Match 的 repr，没书名的书还会在
+            # `opf.title or src.stem` 上直接崩。
+            mark_src = _IMG_SRC_RE.search(m.group(0))
+            if mark_src is None:
                 continue
-            target = _resolve_ref(src.group(1), posixpath.dirname(name), resolve)
+            target = _resolve_ref(mark_src.group(1), posixpath.dirname(name), resolve)
             if target:
                 zy_marks[target] += 1
     for item in opf.items.values():

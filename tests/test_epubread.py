@@ -2288,6 +2288,38 @@ def case_zhangyue_footnote_roundtrip() -> None:
     assert first == second, "回环第二遍的章节文件与第一遍不同"
 
 
+def case_report_source_is_the_file_path() -> None:
+    """导入报告里的来源必须是文件路径，不能被扫注标图时的局部变量顶掉。
+
+    回归：8e8ea9a 统计掌阅注标时写了一句 `src = _IMG_SRC_RE.search(...)`，
+    而 `src` 正是 `_import` 的入参（源文件 Path）。凡是带注标的书，报告里的
+    `source` 都变成 re.Match 的 repr，写进 book.json 之后界面上「原文件」
+    一栏显示成一串 match 对象；没有书名的书还会在 `opf.title or src.stem` 上崩。
+    """
+    book = Book(
+        title="来源假书",
+        author="假作者",
+        source="X:/假/来源.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[
+                    Paragraph(text="假正文里带一条注。",
+                              refs=[{"at": 4, "note": "n1", "label": "[1]"}]),
+                    Paragraph(text="假设注一。", kind="note", anchor="n1"),
+                ],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = tmp / "src.epub"
+        path.write_bytes(build_epub(book, modified=FIXED_MODIFIED).data)
+        report = read_epub_with_report(path).report
+    assert report["source"] == str(path), report["source"]
+
+
 def case_zhangyue_mark_is_not_a_picture() -> None:
     """注标图不算插图：注释多的书里它会被引几十次，别让它顶成"装饰图"。
 
@@ -2351,6 +2383,7 @@ def main() -> int:
         case_table_caption_and_empty_rows,
         case_table_roundtrip,
         case_zhangyue_footnote_roundtrip,
+        case_report_source_is_the_file_path,
         case_zhangyue_mark_is_not_a_picture,
         case_title_note_stays_on_chapter,
         case_note_number_strip_only_foreign,

@@ -1411,6 +1411,47 @@ def _finalize_refs(book) -> None:
                 ]
 
 
+def _drop_unreferenced_anchors(book) -> int:
+    """丢掉原书带进来、但全书没有任何链接指向的 id，返回丢掉条数。
+
+    原书里几乎每个段落外面都套着一层 `<span id="kobo.12.3">`（Kobo 用它记
+    阅读位置），版式容器上还挂着 `book-columns` 这类 id。导入器一律把它们
+    认领成段落 anchor —— 于是一本 820 KB 的书能攒下 2500 多个死 id：
+
+    - 全书没有一条 href 指向它们。目录只指到文件（nav/ncx 的 href 不带
+      片段），所以锚点的消费者只有 refs 一处；删掉不影响目录与脚注；
+    - 合并分片章节时会撞成重复 id（Kobo 是每个源文件都从 kobo.1.1 重新
+      编号的，合并后同一文件里出现 3 个 kobo.2.1），EPUBCheck 按 RSC-005
+      报错；
+    - 2500 处 `id="kobo.x.y"` 在正文里占 37 KB，压缩后也还有 9 KB 的脂肪。
+
+    判据只有一条：**别处有没有链接指过来**。锚点的唯一用途是当落点，所以
+    "被引用"就等于"该留"。注意判据不是"这段是不是注释" —— 注释段的 id
+    自己不带 href，但正文里有注码指着它，照样留下；反过来，一个从没被
+    指过的注码位置（残缺书里的孤儿注释）就没有锚点可言了。
+    """
+    used: set[str] = set()
+    for para in _iter_paragraphs(book):
+        for ref in para.refs or []:
+            if isinstance(ref, dict) and ref.get("note"):
+                used.add(str(ref["note"]))
+        for cell in _iter_cells(para):
+            for ref in cell.get("refs") or []:
+                if isinstance(ref, dict) and ref.get("note"):
+                    used.add(str(ref["note"]))
+
+    dropped = 0
+    for para in _iter_paragraphs(book):
+        if para.anchor and para.anchor not in used:
+            para.anchor = ""
+            dropped += 1
+        for cell in _iter_cells(para):
+            if cell.get("anchor") and cell["anchor"] not in used:
+                cell["anchor"] = ""
+                dropped += 1
+    return dropped
+
+
 def _parse_doc(data: bytes) -> list[list]:
     parser = _DocParser()
     parser.feed(data.decode("utf-8", "replace"))
@@ -2083,6 +2124,10 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     )
     # 全书都解析完了，现在才有资格判"这个引用指向的注释到底在不在"。
     _finalize_refs(book)
+    # 引用裁完之后，反过来把没人指向的 id 清掉（Kobo 的 kobo.*、版式容器的
+    # book-columns 这类）。必须排在 _finalize_refs 之后：那一趟要按完整锚点
+    # 表判断引用是否还有落点，先删就分不清"落点不存在"和"落点被删了"。
+    ids_dropped = _drop_unreferenced_anchors(book)
 
     fonts = sum(
         1 for item in opf.items.values()
@@ -2121,6 +2166,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         "merged_pieces": pieces,
         "front_matter_entries": front_entries,
         "toc_dropped": toc_dropped,
+        # 原书带来、但没有任何链接指向的 id 条数（Kobo 的 kobo.*、容器 id）。
+        # 不是"错误"，是清掉的脂肪；数值大说明原书是 Kobo/Calibre 生成的分片本。
+        "ids_dropped": ids_dropped,
         "continuation_docs": continuation_docs,
         "generated_pages": generated_pages,
         "empty_chapters": sum(1 for ch in merged if not ch.paragraphs),

@@ -527,7 +527,10 @@ def _render_table(
         _warn_once(warnings, f"{where}表格段没有任何单元格，已跳过")
         return None
     narrow_first = _table_narrow_first_col(rows)
-    out: list[str] = ['<table class="tbl">\n']
+    # 表本身的 id 也要写：正文里"见表三"要是链到这张表，落点就在 <table> 上。
+    # 写在 table 上而不是第一个格子：跨行首格常常是合并单元格，不一定是表的起点。
+    tbl_id = f' id="{_esc_attr(p.anchor)}"' if p.anchor else ""
+    out: list[str] = [f'<table class="tbl"{tbl_id}>\n']
     for row in rows:
         cells: list[str] = []
         for idx, cell in enumerate(row):

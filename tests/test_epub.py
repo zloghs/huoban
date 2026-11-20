@@ -1314,7 +1314,7 @@ def case_table_renders_as_table() -> None:
     ]
     book = _book(_chapter("第一章", [
         "表前正文。",
-        Paragraph(text="年代｜重要事件", kind="table", rows=rows),
+        Paragraph(text="年代｜重要事件", kind="table", rows=rows, anchor="t3"),
         "表后正文。",
     ]))
     result = _build(book)
@@ -1326,6 +1326,9 @@ def case_table_renders_as_table() -> None:
     assert len(tables) == 1, len(tables)
     tbl = tables[0]
     assert tbl.get("class") == "tbl", tbl.get("class")
+    # 表自己的锚点要落在 <table> 上 —— 正文里"见表三"的落点就是这里，
+    # 写在第一个格子上会因为跨行合并单元格而错位。
+    assert tbl.get("id") == "t3", tbl.get("id")
 
     # 2) 行列：3 个 tr、2 个 th、4 个 td（空单元格也要占位）
     trs = tbl.findall("xhtml:tr", NS)

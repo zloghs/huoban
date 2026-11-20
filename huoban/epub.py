@@ -59,7 +59,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .fonts import BODY_FAMILY, EXTB_FAMILY, HEADING_FAMILY, FontPlan, plan_fonts
-from .model import PARAGRAPH_KINDS, Book, Chapter, Paragraph
+from .model import PARAGRAPH_KINDS, Book, Chapter, Paragraph, normalize_rows
 
 __all__ = ["EpubResult", "build_epub", "write_epub"]
 
@@ -354,6 +354,12 @@ def _render_paragraphs(
         if kind == "image":
             items.append(("image", p, p))
             continue
+        if kind == "table":
+            # 表格必须走自己的通路：它没有"一行文字"这回事，落进下面的
+            # splitlines 会被按行拆成一串 <p>，表格当场变回一列段落 ——
+            # 那正是导入侧已经修掉的老毛病，不能在输出侧再犯一次。
+            items.append(("table", p, p))
+            continue
         if kind == "sep":
             # 场景分隔线**不看文本**：它渲成一条细横线，原来的装饰字符
             # （"＊＊＊＊＊＊"、"※※※※"、"─────"）一个字都不印。
@@ -438,6 +444,13 @@ def _render_paragraphs(
                 count += 1
             i += 1
             continue
+        if kind == "table":
+            table = _render_table(para, warnings, where, href_of)  # type: ignore[arg-type]
+            if table:
+                out.append(table)
+                count += 1
+            i += 1
+            continue
         # 连续 note 段成组：见 docstring。中间夹了空行/正文就断组 ——
         # 两处注释之间的空行是原书的段落分隔，不是"同一块注释"的延续。
         if kind == "note":
@@ -471,6 +484,70 @@ def _render_paragraphs(
 _IMAGE_TALL = 0.85
 _IMAGE_WIDE = 1.6
 _IMAGE_STRIP = 2.5
+
+
+_TABLE_NARROW_COL_MAX = 4
+
+
+def _table_narrow_first_col(rows: list[list[dict]]) -> bool:
+    """整张表的第一列是不是"短词列"（年代、编号、序号）。
+
+    为什么要判这一下：中文在字与字之间就能断行，所以一列的 min-content 只有
+    一个字宽。手机宽度下浏览器把富余宽度全分给长文本列，第一列会被压到
+    "一个字一行"——「年代」竖排成两行、「1771」被掰成「177/1」，看着像表格坏了。
+    这一列全是短词时禁止折行，它就会老老实实占够自己的宽度。
+    译本对照表那种第一列是整句的，判不中，照旧按可用宽度折行 —— 所以这不是
+    "猜哪一列是表头"，而是按实际文字长度决定要不要禁止折行。
+    """
+    firsts = [row[0]["text"].strip() for row in rows if row and row[0]["text"].strip()]
+    if not firsts:
+        return False
+    return all(len(t) <= _TABLE_NARROW_COL_MAX for t in firsts)
+
+
+def _render_table(
+    p: Paragraph,
+    warnings: list[str],
+    where: str,
+    href_of=None,
+) -> str | None:
+    """把一个 table 段渲成 <table>；网格是空的就返回 None。
+
+    为什么不用 <thead>/<tbody>：原书里表头常常就是普通的 <td>（Calibre 转出来
+    的书尤为常见），硬套 thead 会让"这一行是不是表头"变成一个渲染层无权
+    决定的判断。表头语义改由 <th> 承载 —— 章节树的 header 标记来自原书的
+    真实标签，写 <th> 就是照抄，不是猜。CSS 对 th/td 一视同仁地画边框，
+    表头只多一条"不加粗"的规矩（与章标题同一套审美）。
+
+    为什么 colspan/rowspan 只写大于 1 的：写 colspan="1" 在 Kindle 的渲染
+    引擎里偶尔会被当成"合并了 1 列"，把整行挤成一格。
+    """
+    rows = normalize_rows(p.rows)  # 打包层不依赖上游校验，再归一一次
+    if not any(rows):
+        _warn_once(warnings, f"{where}表格段没有任何单元格，已跳过")
+        return None
+    narrow_first = _table_narrow_first_col(rows)
+    out: list[str] = ['<table class="tbl">\n']
+    for row in rows:
+        cells: list[str] = []
+        for idx, cell in enumerate(row):
+            tag = "th" if cell["header"] else "td"
+            attrs = ""
+            # 短词首列加 nw（nowrap）：见 _table_narrow_first_col。
+            # 跨列的格子不参与——它已经不占"第一列"这个位置了。
+            if narrow_first and idx == 0 and cell["colspan"] == 1:
+                attrs += ' class="nw"'
+            if cell["colspan"] > 1:
+                attrs += f' colspan="{cell["colspan"]}"'
+            if cell["rowspan"] > 1:
+                attrs += f' rowspan="{cell["rowspan"]}"'
+            if cell["anchor"]:
+                attrs += f' id="{_esc_attr(cell["anchor"])}"'
+            text = _sanitize(cell["text"])
+            cells.append(f"<{tag}{attrs}>{_inline_html(text, cell['refs'], href_of)}</{tag}>")
+        out.append("  <tr>" + "".join(cells) + "</tr>\n")
+    out.append("</table>\n")
+    return "".join(out)
 
 
 def _image_ratio_class(width: int, height: int) -> str:
@@ -1340,6 +1417,58 @@ hr.sep {
 div.sep {
     height: 1.1em;
     min-height: 1.1em;
+}
+
+/* 表格（EPUB 导入带进来的年表 / 译本对照表 / 谱系表）。
+   以前没有这一块：重排时表格结构在导入阶段就被拆成了一列段落，样式写了
+   也没东西可套。现在结构保住了，这里负责"画得像一张表"。
+   三条规矩：
+   1. 细边线 + 单元格内边距，靠边框而不是底色把行列分开 —— 底色在深色模式下
+      会把单元格压成一块黑，而边框用的是中灰，两种模式都看得见；
+   2. 字号比正文小一档（0.88em），行距收紧：表格里一格常有二三十字，
+      按正文的 1.8 行距排，一张年表要翻三页；
+   3. text-indent 必须显式归零 —— 正文的 p 是 2em 首行缩进，单元格若继承
+      这个缩进，每一格第一行都会凭空退两格，看着像排版错位。 */
+table.tbl {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.4em 0;
+    font-size: 0.88em;
+    line-height: 1.65;
+    text-indent: 0;
+    /* 这里**不能**用 word-break: break-word：它允许在任意字符间断行，
+       于是窄列里的「1771」会被掰成「177/1」、「年代」会竖排成一个字一行。
+       中文本来就能在字间断行，真正需要兜底的是"一长串西文撑破版面"，
+       那件事由 overflow-wrap 负责 —— 它只在整词放不下时才断。 */
+    overflow-wrap: break-word;
+}
+
+table.tbl th,
+table.tbl td {
+    border: 1px solid rgba(150, 150, 150, 0.55);
+    padding: 0.45em 0.55em;
+    vertical-align: top;
+    text-align: left;
+    text-indent: 0;
+    font-weight: normal;
+}
+
+/* 表头（th）与内容（td）同一条边框规矩，也同一个字重：中文表格里表头与内容
+   往往只差一个"年份/事件"的说明，加粗会把它抬到和章标题同一层级，
+   反而压住了正文。所以上面直接写 font-weight: normal，不另立 th 规则。 */
+
+/* 短词首列不折行（渲染层按实际文字长度决定加不加这个类，见 _table_narrow_first_col）。
+   不加的话：中文能在字间断行，一列的 min-content 只有一个字宽，手机宽度下
+   浏览器会把富余宽度全给长文本列，「年代」竖排成两行、「1771」被掰成「177/1」。 */
+table.tbl td.nw,
+table.tbl th.nw {
+    white-space: nowrap;
+}
+
+/* 跨页时别把一行劈成两半 —— 一行常常就是一条完整的大事记。
+   Kindle 系对这条支持不一致，不支持时退化成默认行为，没有副作用。 */
+table.tbl tr {
+    page-break-inside: avoid;
 }
 
 /* 插图（EPUB 导入带进来的）。四档按宽高比分流，只改容器宽度不改图片本身：

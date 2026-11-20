@@ -36,14 +36,24 @@ from .diagnose import cn_to_int, match_chapter, strip_frame
 # 只在 kind="image" 的段落上出现。这是**纯增量**：v1 的章节树按 v2 读入后
 # 一个字段都不会变（from_dict 接受 1 和 2 两个主版本），to_dict 也只对 image
 # 段写新字段 —— 旧 v1 文件重新序列化后除 version 外逐字节不变（见 docs/gui-design.md 的「EPUB 导入」一节里的验收要求）。
-SCHEMA_VERSION = "2"
+#
+# v2 → v3（EPUB 导入识别表格）：Paragraph 新增 rows 字段，只在 kind="table" 的
+# 段落上出现，同时 PARAGRAPH_KINDS 多一个 "table"。同样是**纯增量**：v1/v2 的
+# 章节树按 v3 读入后一个字段都不会变（from_dict 接受 1/2/3 三个主版本），
+# to_dict 也只在 table 段写 rows —— 旧文件重新序列化后除 version 外逐字节不变。
+SCHEMA_VERSION = "3"
 
 # 段落类型。渲染层按这个决定排版，清洗层按这个标注，两边共用同一份取值。
 # verse = 诗词/韵文（词曰、诗云、右调·XXX 之类）：本质是"引文"，
 # 排版上要跟正文拉开距离 —— 居中、不缩进、换楷体、字号略小。
 # image = 插图（EPUB 导入专用）：text 是**图片文件名**（不是正文），
 # caption 是图说，width/height 是像素尺寸。渲染层把它排成 figure。
-PARAGRAPH_KINDS = ("body", "heading", "blank", "note", "verse", "sep", "image")
+# table = 表格（EPUB 导入专用）：text 是**逐行摊平的纯文本**（每行一格一格的
+# 文字用「｜」连起来，行间用换行），rows 才是真正的二维网格。为什么两份都留：
+# 渲染层要网格才画得出 <table>，而字数统计、字体子集、清洗报告、界面预览
+# 都只认 text —— 让它们各自再去遍历一遍网格，等于把"表格怎么摊平"这件事
+# 复制到四个地方，迟早长歪。
+PARAGRAPH_KINDS = ("body", "heading", "blank", "note", "verse", "sep", "image", "table")
 
 # 图片文件名允许的扩展名（与 epub.py 的 _IMAGE_TYPES 对齐）。
 # image 段的 text 必须满足：非空、纯文件名（不含 / \ 与 ..）、扩展名在此表内 ——
@@ -82,6 +92,15 @@ class Paragraph:
     # 清洗 TXT 那条线永远不写这两个字段，to_dict 也只在非空时才写。
     anchor: str = ""
     refs: list[dict] = field(default_factory=list)
+    # 以下字段只在 kind == "table" 时有意义（schema v3，EPUB 导入专用）：
+    # 整张表的二维网格，rows[行][列] = 一个单元格 dict：
+    #   {"text": 文字, "header": 是不是表头格（<th>）,
+    #    "colspan": 跨列数, "rowspan": 跨行数,
+    #    "anchor": 单元格自己的 HTML id（空串=没有）,
+    #    "refs": 格内行内引用，格式与段落的 refs 相同，偏移相对**本格**文字}
+    # 一律走 normalize_rows() 归一：列数不齐、span 越界、格子写成裸字符串
+    # 都在那一处收敛，渲染层只认规范形态。
+    rows: list[list[dict]] = field(default_factory=list)
 
 
 @dataclass
@@ -253,6 +272,101 @@ def chapter_from_title(title: str, start_line: int = 0) -> Chapter:
     return Chapter(title=title, number=heading.number, level=heading.level, start_line=start_line)
 
 
+# ---------- 表格 ----------
+
+
+# 单元格跨行/跨列的上限。真书里 colspan 到 4 就算宽，超过 20 只可能是脏数据
+# （某些书商把 <td colspan="9999"> 当"整行合并"用）。夹到上限而不是报错：
+# 排版难看还能读，整章渲不出来就不能读了。
+MAX_SPAN = 20
+
+
+def _as_span(value) -> int:
+    """把 colspan/rowspan 归一成 1..MAX_SPAN 的整数。"""
+    n = _as_int(value, 1)
+    if n < 1:
+        return 1
+    return min(n, MAX_SPAN)
+
+
+def _normalize_refs(raw) -> list[dict]:
+    """把 JSON 里的 refs 归一成 [{"at", "note", "label"}]，丢掉目标为空的条目。
+
+    段落与表格单元格共用这一份：两处各写一遍，迟早出现"段落里的偏移从 0 起、
+    单元格里的从 1 起"这种对不上的事。
+    """
+    out: list[dict] = []
+    for r in _as_list(raw):
+        if not isinstance(r, dict):
+            continue
+        note = r.get("note")
+        if not note:
+            continue
+        out.append(
+            {
+                "at": _as_int(r.get("at"), 0),
+                "note": str(note),
+                "label": "" if r.get("label") is None else str(r.get("label")),
+            }
+        )
+    return out
+
+
+def _normalize_cell(cell) -> dict:
+    """把一个单元格归一成 {text, header, colspan, rowspan, anchor, refs}。
+
+    允许格子是裸字符串（手写 JSON 时写 "1771" 比写一整个 dict 省事），
+    也允许缺任意字段 —— 缺的一律按"一个普通格"补，而不是拒绝整张表。
+    """
+    if isinstance(cell, str):
+        return {"text": cell, "header": False, "colspan": 1, "rowspan": 1, "anchor": "", "refs": []}
+    if not isinstance(cell, dict):
+        return {
+            "text": "" if cell is None else str(cell),
+            "header": False,
+            "colspan": 1,
+            "rowspan": 1,
+            "anchor": "",
+            "refs": [],
+        }
+    text = cell.get("text")
+    anchor = cell.get("anchor")
+    return {
+        "text": "" if text is None else str(text),
+        "header": bool(cell.get("header")),
+        "colspan": _as_span(cell.get("colspan")),
+        "rowspan": _as_span(cell.get("rowspan")),
+        "anchor": "" if anchor is None else str(anchor),
+        "refs": _normalize_refs(cell.get("refs")),
+    }
+
+
+def normalize_rows(raw) -> list[list[dict]]:
+    """把任意形状的 rows 归一成"每格都是规范 dict"的二维表。
+
+    不做"列数对齐"：colspan/rowspan 本来就允许行与行长短不一，硬补齐会凭空
+    造出格子。渲染层按 span 排布，列不齐是它的正常输入。
+    """
+    return [[_normalize_cell(cell) for cell in _as_list(row)] for row in _as_list(raw)]
+
+
+def table_plain_text(rows: list[list[dict]], cell_sep: str = "｜") -> str:
+    """把网格摊成纯文本：一行一格，格间用 "｜"，行间用换行。
+
+    摊平规则只在这里写一份（见 PARAGRAPH_KINDS 里 kind="table" 的说明）：
+    字数统计、字体子集、清洗报告、界面预览、TXT 输出全都靠它。
+    行尾的空格去掉 —— 表格末列常是空的（原书里"这一栏没内容"），
+    留着会变成一串没有意义的 "｜｜｜"。
+    """
+    lines: list[str] = []
+    for row in rows:
+        cells = [c.get("text", "").strip() for c in row]
+        while cells and not cells[-1]:
+            cells.pop()
+        lines.append(cell_sep.join(cells))
+    return "\n".join(lines)
+
+
 # ---------- 序列化 ----------
 
 
@@ -264,6 +378,24 @@ def _paragraph_to_dict(p: Paragraph) -> dict:
         d["caption"] = p.caption
         d["width"] = p.width
         d["height"] = p.height
+    if p.kind == "table":
+        # 只写"不是默认值"的键：一张 24 行 × 3 列的年表有 70 多个格子，
+        # 每格都写全六个键，book.json 会变成一堆 "colspan": 1 的噪声，
+        # 人眼再也看不出表格结构。缺的键由 _normalize_cell 补默认值。
+        d["rows"] = [
+            [
+                {
+                    "text": c["text"],
+                    **({"header": True} if c["header"] else {}),
+                    **({"colspan": c["colspan"]} if c["colspan"] > 1 else {}),
+                    **({"rowspan": c["rowspan"]} if c["rowspan"] > 1 else {}),
+                    **({"anchor": c["anchor"]} if c["anchor"] else {}),
+                    **({"refs": c["refs"]} if c["refs"] else {}),
+                }
+                for c in row
+            ]
+            for row in normalize_rows(p.rows)
+        ]
     # anchor / refs 同理：只在真有值时写。清洗 TXT 那条线产出的段落
     # 两个字段都空，序列化结果与之前逐字节相同。
     if p.anchor:
@@ -287,20 +419,6 @@ def _paragraph_from_dict(raw) -> Paragraph:
     kind = raw.get("kind")
     caption = raw.get("caption")
     anchor = raw.get("anchor")
-    refs: list[dict] = []
-    for r in _as_list(raw.get("refs")):
-        if not isinstance(r, dict):
-            continue
-        note = r.get("note")
-        if not note:
-            continue
-        refs.append(
-            {
-                "at": _as_int(r.get("at"), 0),
-                "note": str(note),
-                "label": "" if r.get("label") is None else str(r.get("label")),
-            }
-        )
     return Paragraph(
         text="" if text is None else str(text),
         kind="body" if kind is None else str(kind),
@@ -308,7 +426,8 @@ def _paragraph_from_dict(raw) -> Paragraph:
         width=_as_int(raw.get("width"), 0),
         height=_as_int(raw.get("height"), 0),
         anchor="" if anchor is None else str(anchor),
-        refs=refs,
+        refs=_normalize_refs(raw.get("refs")),
+        rows=normalize_rows(raw.get("rows")),
     )
 
 
@@ -406,12 +525,12 @@ def from_dict(d: dict) -> Book:
 
     version = str(d.get("version", SCHEMA_VERSION))
     major = version.split(".")[0].strip()
-    # v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），旧文件按
-    # v2 读入无损 —— 所以两个主版本都接受；其余版本仍然拒绝，宁可当场报错，
-    # 也不按不认识的语义读出一本结构错位的书。
-    if major not in ("1", "2"):
+    # v3 相对 v2 只是 Paragraph 多了一个默认字段（table 段专用），v2 相对 v1
+    # 同理（image 段专用），旧文件按新版本读入都无损 —— 所以三个主版本都接受；
+    # 其余版本仍然拒绝，宁可当场报错，也不按不认识的语义读出一本结构错位的书。
+    if major not in ("1", "2", "3"):
         raise ValueError(
-            f"不认识的章节树版本 {version!r}（当前支持 1 和 {SCHEMA_VERSION}）："
+            f"不认识的章节树版本 {version!r}（当前支持 1/2/{SCHEMA_VERSION}）："
             "字段含义可能已变，拒绝按旧语义读出错误的章节结构"
         )
 
@@ -542,15 +661,35 @@ def validate_items(book: Book) -> list[dict]:
     8. 图片段（kind="image"）的 text 不是安全的图片文件名（空 / 带路径分隔符 /
        带 .. / 扩展名不在白名单）—— 渲染层会把它拼进 ../Images/<name>，
        脏名字等于路径穿越；
-    9. 非图片段带了 caption（图说只属于 image 段，渲染层会忽略它 —— 不报就悄悄丢了）。
+    9. 非图片段带了 caption（图说只属于 image 段，渲染层会忽略它 —— 不报就悄悄丢了）；
+    10. 表格段（kind="table"）的网格是空的，或者某个单元格的 anchor / refs 不合法
+        （同第 8 条的理由：这些值会被原样拼进 xhtml）。
     """
     issues: list[dict] = []
 
     def _add(code: str, level: str, text: str) -> None:
         issues.append({"code": code, "level": level, "text": text})
 
+    def _check_refs(refs, text: str, where: str) -> None:
+        """行内引用的契约检查（段落与表格单元格共用）。
+
+        at 的上界按**它自己的那段文字**算：单元格里的偏移只相对那一格，
+        拿整张表的长度去比会把每一格都报成越界。
+        """
+        for ref in refs:
+            note = str(ref.get("note") or "")
+            if not note:
+                _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用的目标为空：渲染层拼不出链接")
+            elif not _SAFE_ID.match(note):
+                _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用目标 {note!r} 不是安全的 HTML id")
+            at = ref.get("at")
+            if not isinstance(at, int) or isinstance(at, bool) or at < 0:
+                _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用的位置 {at!r} 不是非负整数")
+            elif at > len(text):
+                _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用的位置 {at} 超出这段文字的长度 {len(text)}")
+
     def _check_paragraph(p: Paragraph, label: str) -> None:
-        """单段的契约检查（图片文件名白名单 / caption 归属）。"""
+        """单段的契约检查（图片文件名白名单 / caption 归属 / 表格网格）。"""
         if p.kind == "image":
             name = p.text.strip()
             if not name:
@@ -571,17 +710,25 @@ def validate_items(book: Book) -> list[dict]:
         # anchor / refs 会直接拼进 xhtml 的 id 与 href：脏值等于注入。
         if p.anchor and not _SAFE_ID.match(p.anchor):
             _add("bad_anchor", LEVEL_LAYOUT, f"{label}段落 anchor {p.anchor!r} 不是安全的 HTML id（含空白或引号等）")
-        for ref in p.refs:
-            note = str(ref.get("note") or "")
-            if not note:
-                _add("bad_ref", LEVEL_LAYOUT, f"{label}行内引用的目标为空：渲染层拼不出链接")
-            elif not _SAFE_ID.match(note):
-                _add("bad_ref", LEVEL_LAYOUT, f"{label}行内引用目标 {note!r} 不是安全的 HTML id")
-            at = ref.get("at")
-            if not isinstance(at, int) or at < 0:
-                _add("bad_ref", LEVEL_LAYOUT, f"{label}行内引用的位置 {at!r} 不是非负整数")
-            elif at > len(p.text):
-                _add("bad_ref", LEVEL_LAYOUT, f"{label}行内引用的位置 {at} 超出本段长度 {len(p.text)}")
+        _check_refs(p.refs, p.text, label)
+        if p.kind == "table":
+            # 先归一再看：手写的章节树（测试、手改 JSON）里格子可能缺键，
+            # 直接下标取值会让校验本身抛 KeyError —— 校验器崩掉比校验不出来更糟。
+            rows = normalize_rows(p.rows)
+            # 表格没有 text 可数，只能看网格：一格都没有 = 渲染层画不出东西，
+            # 直接跳过，读者不会知道这里原本有张表。
+            if not any(rows):
+                _add("table_empty", LEVEL_LAYOUT,
+                    f"{label}表格段一个单元格都没有（rows 为空）：渲染层会跳过这张表"
+                )
+            for r, row in enumerate(rows):
+                for c, cell in enumerate(row):
+                    pos = f"{label}表格第 {r + 1} 行第 {c + 1} 格"
+                    if cell["anchor"] and not _SAFE_ID.match(cell["anchor"]):
+                        _add("bad_anchor", LEVEL_LAYOUT,
+                            f"{pos}的 anchor {cell['anchor']!r} 不是安全的 HTML id（含空白或引号等）"
+                        )
+                    _check_refs(cell["refs"], cell["text"], pos)
 
     if not book.encoding.strip():
         _add("encoding_empty", LEVEL_LAYOUT, "encoding 字段为空：清洗时没记录原始编码，日后无法复核解码是否正确")

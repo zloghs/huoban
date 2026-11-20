@@ -78,9 +78,11 @@ def _paragraph_lines(p: Paragraph, indent: str) -> list[str]:
         return ["", ""]  # 空段当两行空行，不输出一行缩进空白
 
     pieces = text.splitlines() or [text]
-    if p.kind in ("heading", "sep"):
+    if p.kind in ("heading", "sep", "table"):
         # heading 与 sep 都不缩进：前者是标题，后者是居中的装饰分隔线，
         # 给它加段首缩进会让"＊＊＊＊＊＊"看上去像正文里的一行乱码。
+        # table 同理：它的 text 已经是"一行一格、格间用｜"的摊平结果
+        # （见 model.table_plain_text），每行都缩两格会让表格歪成阶梯。
         return [s.rstrip() for s in pieces]
     return [indent + s.lstrip() for s in pieces]
 

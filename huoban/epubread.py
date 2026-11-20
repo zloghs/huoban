@@ -34,7 +34,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from .clean import _is_separator_line
-from .model import Book, Chapter, Paragraph, parse_heading
+from .model import Book, Chapter, Paragraph, normalize_rows, parse_heading, table_plain_text
 
 # 图片扩展名与 media-type。与 epub.py 的 _IMAGE_TYPES 保持一致（那边是打包侧）。
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif")
@@ -808,6 +808,8 @@ class _DocParser(html.parser.HTMLParser):
         # 正在收集的注释引用：{"frag": 目标 id, "buf": [显示文字]}
         self._ref: dict | None = None
         self._ref_seq = 0
+        # 正在收集的表格（不在表格里时是 None）。结构见 _tbl_begin。
+        self._tbl: dict | None = None
 
     # -- 内部工具 --
 
@@ -836,6 +838,9 @@ class _DocParser(html.parser.HTMLParser):
             # 它要以链接的形式回到原位，直接写进正文就成了死文字。
             self._ref["buf"].append(data)
             return
+        if self._tbl is not None:
+            self._tbl_append(data)
+            return
         if self._frames:
             self._frames[-1][2].append(data)
         else:
@@ -843,10 +848,25 @@ class _DocParser(html.parser.HTMLParser):
 
     def _append_raw(self, data: str) -> None:
         """把哨兵写进当前缓冲，绕开引用收集（哨兵不是正文）。"""
+        if self._tbl is not None:
+            self._tbl_append(data)
+            return
         if self._frames:
             self._frames[-1][2].append(data)
         else:
             self._body_buf.append(data)
+
+    def _refs_sink(self) -> list:
+        """行内引用该记到哪儿：单元格 > 当前帧 > 正文缓冲。
+
+        格内的注码必须跟着格子走 —— 记到段落的 refs 里，偏移是相对整段的，
+        而格子的偏移相对那一格，两套坐标混在一起会让链接插到别的字中间。
+        """
+        if self._tbl is not None and self._tbl["cell"] is not None:
+            return self._tbl["cell"]["refs"]
+        if self._frames:
+            return self._frames[-1][5]
+        return self._body_refs
 
     def _on_image(self, src: str, attrs: dict) -> None:
         src = (src or "").strip()
@@ -898,6 +918,136 @@ class _DocParser(html.parser.HTMLParser):
             item.append(refs)
         self.items.append(item)
         self.text_since_image = True
+
+    # -- 表格 --
+
+    def _tbl_begin(self, anchor: str) -> None:
+        """开始收集一张表。
+
+        为什么整张表单独收、不复用帧栈：帧栈的模型是"一个块 = 一个段落"，
+        而表格要的是二维关系（第几行、第几列、跨几行几列）。在帧栈上再叠一层
+        "现在是第几格"只会把 _close_frame 变成一团乱麻 —— 事实上，正是
+        "_BLOCK_TAGS 里有 td/th、没有 table/tr"这套半吊子白名单，把原书里的
+        年表拆成了一列段落。这里另开一份状态，收完整个 <table> 一次性吐出
+        一个 ["table", rows] 项。
+        """
+        if self._tbl is not None:
+            # 嵌套表：结构不再分叉，内层文字并进外层格。真实 EPUB 里嵌套表
+            # 极少，为它加"表格套表格"的模型不值当，但文字不能丢。
+            self._tbl["depth"] += 1
+            return
+        self._flush_body()
+        if self._frames:
+            self._frames[-1][3] = True
+        self._tbl = {
+            "depth": 1,
+            "rows": [],
+            "row": None,
+            "cell": None,
+            "loose": [],   # 格外的文字（<caption> 表题、表前直接写的说明）
+        }
+        if anchor and not self._pending_anchor:
+            self._pending_anchor = anchor
+
+    def _tbl_append(self, data: str) -> None:
+        if self._tbl is None:
+            return
+        if self._tbl["cell"] is not None:
+            self._tbl["cell"]["buf"].append(data)
+        else:
+            self._tbl["loose"].append(data)
+
+    def _tbl_tag_start(self, tag: str, a: dict) -> None:
+        t = self._tbl
+        if t is None or t["depth"] > 1:
+            return
+        if tag == "tr":
+            self._tbl_end_row()
+            t["row"] = []
+            return
+        if tag in ("td", "th"):
+            self._tbl_end_cell()
+            if t["row"] is None:
+                t["row"] = []
+            t["cell"] = {
+                "buf": [],
+                "header": tag == "th",
+                # colspan/rowspan 先按原样的字符串收着，归一交给
+                # model.normalize_rows —— "10"、""、"abc" 都在那一处收敛，
+                # 解析层不该自己再写一套整数校验。
+                "colspan": a.get("colspan") or "",
+                "rowspan": a.get("rowspan") or "",
+                "anchor": a.get("id") or a.get("name") or "",
+                "refs": [],
+            }
+            return
+        if tag == "br":
+            self._tbl_append(" ")
+            return
+        # 其余标签（span / strong / p / div / a …）在格内一律当行内标记：
+        # 文字照收，不建帧、不切段。图片不搬 —— 表格里塞位图极少见，
+        # 硬搬会把一张表拆成"表 + 图 + 表"三截，反而毁了结构。
+
+    def _tbl_tag_end(self, tag: str) -> None:
+        if self._tbl is None or self._tbl["depth"] > 1:
+            return
+        if tag in ("td", "th"):
+            self._tbl_end_cell()
+        elif tag == "tr":
+            self._tbl_end_row()
+
+    def _tbl_end_cell(self) -> None:
+        t = self._tbl
+        if t is None or t["cell"] is None:
+            return
+        cell = t["cell"]
+        t["cell"] = None
+        if t["row"] is None:
+            t["row"] = []
+        t["row"].append(
+            {
+                "text": _clean_text("".join(cell["buf"])),
+                "header": cell["header"],
+                "colspan": cell["colspan"],
+                "rowspan": cell["rowspan"],
+                "anchor": cell["anchor"],
+                "refs": cell["refs"],
+            }
+        )
+
+    def _tbl_end_row(self) -> None:
+        t = self._tbl
+        if t is None:
+            return
+        self._tbl_end_cell()
+        if t["row"]:
+            t["rows"].append(t["row"])
+        t["row"] = None
+
+    def _tbl_end(self) -> None:
+        """收完一张表：把网格吐成一个 item。
+
+        表题（<caption> 或表格前紧挨着的说明）单独成一段，排在表前 ——
+        它是读者理解这张表的入口，丢掉就等于给了一张没有标题的年表。
+        它不抢表格自己的 id：那个 id 是别人链接过来的落点。
+        """
+        t = self._tbl
+        if t is None:
+            return
+        if t["depth"] > 1:
+            t["depth"] -= 1
+            return
+        self._tbl_end_row()
+        self._tbl = None
+        loose = _clean_text("".join(t["loose"]))
+        if loose:
+            self.items.append(["text", loose, "body"])
+            self.text_since_image = True
+        if any(t["rows"]):
+            if self._pending_anchor:
+                self.items.append(["anchor", self._pending_anchor])
+                self._pending_anchor = ""
+            self.items.append(["table", t["rows"]])
 
     @staticmethod
     def _kind_of(tag: str, attrs: dict, text: str) -> str:
@@ -967,6 +1117,16 @@ class _DocParser(html.parser.HTMLParser):
                 if aid and not self._pending_anchor:
                     self._pending_anchor = aid
                 return
+        # 表格要整张收成一个结构化项，不能按块级标签一格一段地拆（见 _tbl_begin）。
+        # 这一分支必须排在"块级标签"之前：table / tr / td 在白名单里出现过
+        # 一半（td/th 有、table/tr 没有），照旧走过去的结果就是每个单元格
+        # 各成一段，行列关系全部丢失。
+        if tag == "table":
+            self._tbl_begin(a.get("id") or a.get("name") or "")
+            return
+        if self._tbl is not None:
+            self._tbl_tag_start(tag, a)
+            return
         anchor_id = a.get("id") or a.get("name")
         if anchor_id and tag not in _BLOCK_TAGS:
             # 段内的 id（脚注锚点几乎都在段内的 <a>/<sup> 上）：挂到待认领，
@@ -1029,14 +1189,18 @@ class _DocParser(html.parser.HTMLParser):
                 self._ref_seq += 1
                 seq = self._ref_seq
                 self._append_raw("\x01%d\x02" % seq)
-                entry = (seq, frag, label)
-                if self._frames:
-                    self._frames[-1][5].append(entry)
-                else:
-                    self._body_refs.append(entry)
+                self._refs_sink().append((seq, frag, label))
             elif label:
                 # 没有 #片段：不是可跳转的引用，把显示文字原样放回正文。
                 self._append_raw(label)
+            return
+        # 表格内部的收尾：必须排在 <a> 之后（格内的注码要先把哨兵落进格子里），
+        # 排在块级标签收帧之前（格内的 <p>/<div> 不建帧，只当行内标记）。
+        if tag == "table":
+            self._tbl_end()
+            return
+        if self._tbl is not None:
+            self._tbl_tag_end(tag)
             return
         if tag not in _BLOCK_TAGS:
             return
@@ -1076,9 +1240,63 @@ class _DocParser(html.parser.HTMLParser):
             # 不然这一段末尾的字会整块消失。
             self._append_raw(_clean_text("".join(self._ref["buf"])))
             self._ref = None
+        if self._tbl is not None:
+            # 截断的文档里表格没闭合：把已经收到的部分吐出来，
+            # 宁可少几格，也别把整张表静悄悄咽掉。
+            self._tbl["depth"] = 1
+            self._tbl_end()
         while self._frames:
             self._close_frame(self._frames.pop())
         self._flush_body()
+
+
+def _resolve_sentinels(text: str, raw_refs: list, drop_leading: bool) -> tuple[str, list[dict]]:
+    """把一段文字里的哨兵换成真实偏移，返回 (去掉哨兵的文字, 引用清单)。
+
+    drop_leading=True 时丢掉落在第 0 字的引用：那是注释段开头指回正文的
+    反向链接，留着会在注释开头多印一个"〔1〕"。
+
+    段落与表格单元格共用本函数 —— 单元格里的偏移相对那一格，段落里的相对
+    整段，两边的算法必须是同一份，否则总有一边插错位置。
+    """
+    if "\x01" not in text:
+        return text, []
+    by_seq = {seq: (frag, label) for seq, frag, label in raw_refs}
+    pieces: list[str] = []
+    kept: list[dict] = []
+    pos = 0
+    cur = 0
+    for m in _REF_SENTINEL.finditer(text):
+        chunk = text[pos:m.start()]
+        pieces.append(chunk)
+        cur += len(chunk)
+        info = by_seq.get(int(m.group(1)))
+        if info is None:
+            pass  # 找不到对应记录（不该发生）：哨兵直接消失
+        elif drop_leading and cur == 0:
+            # 注释段开头那个 "[1]" 是"回到正文"的反向链接（几乎总是跨
+            # 文件，本篇里没有落点）。还原成文字只会变成注释开头的
+            # 多余编号 —— 正文那边已经有指过来的链接了，这里直接丢掉。
+            # 这条判断必须排在"目标存在就保留"之前：反向链接指向的是
+            # 正文里的锚点，全书锚点表里通常真能找到它。
+            pass
+        else:
+            # 目标不在本文档也先留着：Calibre 这类书把正文和注释
+            # 分成两个 xhtml 文件，注释的落点在别的文件里。真正的
+            # 有效性由全书锚点表在 _finalize_refs 里统一裁决。
+            kept.append({"at": cur, "note": info[0], "label": info[1]})
+        pos = m.end()
+    pieces.append(text[pos:])
+    return "".join(pieces), kept
+
+
+def _iter_cells(para):
+    """遍历一个段落里的所有表格单元格（非 table 段什么都不吐）。"""
+    if getattr(para, "kind", "") != "table":
+        return
+    for row in getattr(para, "rows", []) or []:
+        for cell in row:
+            yield cell
 
 
 def _resolve_refs(items: list[list]) -> None:
@@ -1090,44 +1308,19 @@ def _resolve_refs(items: list[list]) -> None:
     本文档里有落点的引用直接定下来；没有落点的**先保留**（note 段开头的
     反向链接除外 —— 那是注释自己的编号，正文那边已经有指过来的链接了）。
     跨文件的落点要靠全书锚点表才能判，见 _finalize_refs。
+
+    表格要单独走一遍：格内的哨兵收在 cell["text"] 里、引用收在
+    cell["refs"] 里，跟段落的 item[1]/item[3] 不是同一处。
     """
-    anchors = {item[1] for item in items if item[0] == "anchor"}
     for item in items:
-        if item[0] != "text" or len(item) < 4:
-            continue
-        text = item[1]
-        raw_refs = item[3]
-        by_seq = {seq: (frag, label) for seq, frag, label in raw_refs}
-        if "\x01" not in text:
-            item[3] = []
-            continue
-        pieces: list[str] = []
-        kept: list[dict] = []
-        pos = 0
-        cur = 0
-        for m in _REF_SENTINEL.finditer(text):
-            chunk = text[pos:m.start()]
-            pieces.append(chunk)
-            cur += len(chunk)
-            info = by_seq.get(int(m.group(1)))
-            if info is None:
-                pass  # 找不到对应记录（不该发生）：哨兵直接消失
-            elif item[2] == "note" and cur == 0:
-                # 注释段开头那个 "[1]" 是"回到正文"的反向链接（几乎总是跨
-                # 文件，本篇里没有落点）。还原成文字只会变成注释开头的
-                # 多余编号 —— 正文那边已经有指过来的链接了，这里直接丢掉。
-                # 这条判断必须排在"目标存在就保留"之前：反向链接指向的是
-                # 正文里的锚点，全书锚点表里通常真能找到它。
-                pass
-            else:
-                # 目标不在本文档也先留着：Calibre 这类书把正文和注释
-                # 分成两个 xhtml 文件，注释的落点在别的文件里。真正的
-                # 有效性由全书锚点表在 _finalize_refs 里统一裁决。
-                kept.append({"at": cur, "note": info[0], "label": info[1]})
-            pos = m.end()
-        pieces.append(text[pos:])
-        item[1] = "".join(pieces)
-        item[3] = kept
+        if item[0] == "text" and len(item) >= 4:
+            item[1], item[3] = _resolve_sentinels(item[1], item[3], item[2] == "note")
+        elif item[0] == "table":
+            for row in item[1]:
+                for cell in row:
+                    cell["text"], cell["refs"] = _resolve_sentinels(
+                        cell["text"], cell["refs"], False
+                    )
 
 
 def _iter_paragraphs(book):
@@ -1150,13 +1343,20 @@ def _finalize_refs(book) -> None:
     留一条点了没反应的死链接，比不链接更让人困惑。
     """
     anchors = {p.anchor for p in _iter_paragraphs(book) if p.anchor}
-    for para in _iter_paragraphs(book):
-        if not para.refs:
-            continue
-        text = para.text or ""
+    # 表格单元格也能被链接（"见表 3"指向格子的 id），落点表要一并收进来。
+    anchors |= {
+        cell["anchor"]
+        for para in _iter_paragraphs(book)
+        for cell in _iter_cells(para)
+        if cell.get("anchor")
+    }
+
+    def _fix_refs(text: str, refs: list[dict]) -> tuple[str, list[dict]]:
+        """落点不存在的引用还原成显示文字，返回 (新文字, 留下的引用)。"""
+        text = text or ""
         kept: list[dict] = []
         shift = 0
-        for ref in sorted(para.refs, key=lambda r: r.get("at", 0)):
+        for ref in sorted(refs, key=lambda r: r.get("at", 0)):
             at = ref.get("at")
             if not isinstance(at, int) or isinstance(at, bool):
                 continue
@@ -1170,8 +1370,14 @@ def _finalize_refs(book) -> None:
             else:
                 text = text[:pos] + label + text[pos:]
                 shift += len(label)
-        para.text = text
-        para.refs = kept
+        return text, kept
+
+    for para in _iter_paragraphs(book):
+        if para.refs:
+            para.text, para.refs = _fix_refs(para.text or "", para.refs)
+        for cell in _iter_cells(para):
+            if cell.get("refs"):
+                cell["text"], cell["refs"] = _fix_refs(cell["text"], cell["refs"])
 
     # 被注释引用指到的段落就是注释本体。Calibre 和毛宗岗评本这类书，注释条目
     # 没有任何 type 属性（<p><a id="pnote1">〚1〛</a>注文…</p>），唯一的线索
@@ -1183,7 +1389,7 @@ def _finalize_refs(book) -> None:
     referenced = {
         r.get("note")
         for para in _iter_paragraphs(book)
-        for r in (para.refs or [])
+        for r in list(para.refs or []) + [x for cell in _iter_cells(para) for x in cell.get("refs") or []]
         if isinstance(r, dict) and isinstance(r.get("at"), int) and r["at"] > 0
     }
     for para in _iter_paragraphs(book):
@@ -1650,6 +1856,20 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                     )
                 )
                 pending_anchor = ""
+            elif item[0] == "table":
+                # 归一在这一层做（列数不齐、span 越界、格子写成裸字符串都在
+                # normalize_rows 里收敛），落进章节树的永远是规范网格。
+                rows = normalize_rows(item[1])
+                if rows and any(rows):
+                    current.append(
+                        Paragraph(
+                            text=table_plain_text(rows),
+                            kind="table",
+                            anchor=pending_anchor,
+                            rows=rows,
+                        )
+                    )
+                    pending_anchor = ""
             elif item[0] == "image":
                 _emit_image(item[1], item[2])
 

@@ -23,9 +23,11 @@ from huoban.model import (  # noqa: E402
     chapter_from_title,
     from_dict,
     load,
+    normalize_rows,
     parse_heading,
     save,
     stats,
+    table_plain_text,
     to_dict,
     validate,
 )
@@ -347,13 +349,14 @@ def case_save_load_identical() -> None:
 def case_version_guard() -> None:
     """主版本号不认识时必须报错，不能按旧语义读出一本错位的书。
 
-    v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），旧文件按 v2
-    读入无损 —— 所以 1 和 2 都要接受；其余主版本仍然拒绝。
+    v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），v3 相对 v2
+    只多一个 rows（table 段专用），旧文件按新版本读入都无损 —— 所以 1/2/3
+    都要接受；其余主版本仍然拒绝。
     """
-    for good in ("1", "2", "2.0", "1.5.9-rc"):
+    for good in ("1", "2", "3", "3.0", "1.5.9-rc"):
         ok = from_dict({"version": good, "chapters": []})
         assert isinstance(ok, Book), good
-    for bad in ("0", "3", "9.0"):
+    for bad in ("0", "4", "9.0"):
         try:
             from_dict({"version": bad, "chapters": []})
         except ValueError:
@@ -431,6 +434,110 @@ def case_v1_tree_reserializes_unchanged() -> None:
     assert to_dict(book)["front_matter"] == v1["front_matter"]
 
 
+def case_table_rows_roundtrip() -> None:
+    """table 段的 rows 必须原样进出 JSON；span 越界与裸字符串在归一里收敛。
+
+    真实来源：嘯風山莊（艾蜜莉·布朗忒）4 张年表。表格能不能挺过"导入 → 打包
+    → 再导入"，全看这一层 —— 结构在序列化上丢一次，回环就永远回不去，
+    用户每导一次烂一层。
+    """
+    book = Book(
+        encoding="utf-8",
+        chapters=[
+            Chapter(
+                title="第一章",
+                number=1,
+                level=1,
+                start_line=1,
+                paragraphs=[
+                    Paragraph(
+                        text="年代｜重要事件\n1771｜去利物浦。",
+                        kind="table",
+                        rows=[
+                            [{"text": "年代", "header": True}, {"text": "重要事件", "header": True}],
+                            [{"text": "1771", "rowspan": 2}, {"text": "去利物浦。"}],
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+    d = to_dict(book)
+    para = d["chapters"][0]["paragraphs"][0]
+    assert para["kind"] == "table", para
+    # 默认值不落盘：colspan/rowspan=1、空 anchor、空 refs 都不写，
+    # 否则一张 24 行 3 列的年表会变成一堆 "colspan": 1 的噪声。
+    assert para["rows"][0][0] == {"text": "年代", "header": True}, para["rows"][0][0]
+    assert para["rows"][1][0] == {"text": "1771", "rowspan": 2}, para["rows"][1][0]
+
+    back = from_dict(json.loads(json.dumps(d, ensure_ascii=False)))
+    got = back.chapters[0].paragraphs[0]
+    assert got.kind == "table", got.kind
+    assert [[c["text"] for c in r] for r in got.rows] == [["年代", "重要事件"], ["1771", "去利物浦。"]]
+    assert [c["header"] for c in got.rows[0]] == [True, True], got.rows[0]
+    assert got.rows[1][0]["rowspan"] == 2, got.rows[1][0]
+
+    # 归一：裸字符串当普通格；span 夹到 1..MAX_SPAN；缺的键补默认值
+    rows = normalize_rows([["甲", {"text": "乙", "colspan": "9999", "rowspan": "0"}]])
+    assert rows[0][0] == {"text": "甲", "header": False, "colspan": 1, "rowspan": 1,
+                          "anchor": "", "refs": []}, rows[0][0]
+    assert rows[0][1]["colspan"] == 20, rows[0][1]
+    assert rows[0][1]["rowspan"] == 1, "rowspan=0 是非法的，按不跨行处理"
+
+    # 摊平：行尾空列去掉（否则会出现一串没有意义的 ｜），中间空列保留
+    flat = table_plain_text([
+        [{"text": "年代"}, {"text": "事件"}],
+        [{"text": "1771"}, {"text": ""}],
+        [{"text": "1774"}, {"text": "上学"}, {"text": ""}],
+    ])
+    assert flat == "年代｜事件\n1771\n1774｜上学", repr(flat)
+
+
+def case_validate_table() -> None:
+    """空网格的表格段要报出来：渲染层会静默跳过它，读者不会知道这里原本有张表。"""
+    empty = Book(
+        encoding="utf-8",
+        chapters=[Chapter(title="一", number=1, level=1, start_line=1,
+                          paragraphs=[Paragraph(text="正文。"),
+                                      Paragraph(text="", kind="table", rows=[])])],
+    )
+    assert any("表格" in msg for msg in validate(empty)), validate(empty)
+
+    # 单元格里的 anchor/refs 同样过白名单：它们会被原样拼进 xhtml 属性
+    bad = Book(
+        encoding="utf-8",
+        chapters=[Chapter(title="一", number=1, level=1, start_line=1,
+                          paragraphs=[Paragraph(text="甲", kind="table", rows=[
+                              [{"text": "甲", "anchor": 'a"b',
+                                "refs": [{"at": 9, "note": "n1", "label": "[1]"}]}],
+                          ])])],
+    )
+    msgs = validate(bad)
+    assert any("anchor" in m for m in msgs), msgs
+    assert any("行内引用" in m for m in msgs), msgs
+
+    good = Book(
+        encoding="utf-8",
+        chapters=[Chapter(title="一", number=1, level=1, start_line=1,
+                          paragraphs=[Paragraph(text="甲", kind="table", rows=[
+                              [{"text": "甲", "anchor": "cell1",
+                                "refs": [{"at": 1, "note": "n1", "label": "[1]"}]}],
+                          ]),
+                              Paragraph(text="注。", kind="note", anchor="n1")])],
+    )
+    assert validate(good) == [], validate(good)
+
+    # 手写的格子缺键、或干脆是裸字符串：校验器不能崩。归一发生在读入
+    # （from_dict）与渲染两层，但校验不能假定调用方一定走过那两步 ——
+    # 校验器自己抛 KeyError，比"没校验出来"更难查。
+    loose = Book(
+        encoding="utf-8",
+        chapters=[Chapter(title="一", number=1, level=1, start_line=1,
+                          paragraphs=[Paragraph(text="甲", kind="table", rows=[["甲", {"text": "乙"}]])])],
+    )
+    assert isinstance(validate(loose), list), validate(loose)
+
+
 def main() -> int:
     cases = [
         case_roundtrip,
@@ -445,6 +552,8 @@ def main() -> int:
         case_stats,
         case_save_load_identical,
         case_version_guard,
+        case_table_rows_roundtrip,
+        case_validate_table,
         case_v1_tree_reserializes_unchanged,
         case_framed_heading_keeps_its_number,
     ]

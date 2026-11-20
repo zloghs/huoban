@@ -1920,6 +1920,164 @@ def case_cli_reflow_redact_hides_paths_and_errors() -> None:
         assert str(payload["epub"]).startswith("〔"), payload["epub"]
 
 
+def case_table_structure_kept() -> None:
+    """表格必须整张收成一个 table 段：行列、表头、跨行跨列、格内注码都不能散。
+
+    真实来源：嘯風山莊（艾蜜莉·布朗忒，赖慈芸译本）里有 4 张表 —— 故事年表、
+    作者与世界大事年表、译本对照表、阅读笔记表。旧实现把 td/th 当块级标签、
+    table/tr 又不认，于是每个单元格都成了一段正文：年表被拉成一列"年代 /
+    重要事件 / 1771 / 恩萧先生去利物浦……"，行列关系全丢，读者根本对不上号。
+    """
+    table = (
+        '<table id="table-3">'
+        "<tr><th>年代</th><th>重要事件</th></tr>"
+        '<tr><td rowspan="2">1771</td><td>恩萧先生去利物浦，带回弃儿希斯克利夫。</td></tr>'
+        "<tr><td>十一月：凯瑟琳留在鸫翔庄园。</td></tr>"
+        '<tr><td colspan="2">注<a epub:type="noteref" href="#n1">[1]</a></td></tr>'
+        "</table>"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        opf = _opf(
+            spine=["c1"],
+            manifest=[
+                ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        )
+        ncx = _ncx(_navpoint("第一章 开端", "Text/ch1.xhtml"))
+        entries = {
+            "OEBPS/content.opf": opf,
+            "OEBPS/toc.ncx": ncx,
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body="<h1>第一章 开端</h1><p>表前正文。</p>" + table
+                + '<p id="n1">注释一。</p><p>表后正文。</p>'
+            ),
+        }
+        book = read_epub(_epub(tmp, entries))
+        ch = book.chapters[0]
+
+        # 1) 表还是一段，没有被拆成"一格一段"的正文流
+        assert _kinds(ch) == ["body", "table", "note", "body"], _kinds(ch)
+        para = ch.paragraphs[1]
+        assert para.kind == "table"
+        assert para.anchor == "table-3", para.anchor
+
+        # 2) 行列结构：4 行，第 1 行是表头
+        assert len(para.rows) == 4, [[c["text"] for c in r] for r in para.rows]
+        head = para.rows[0]
+        assert [c["text"] for c in head] == ["年代", "重要事件"], head
+        assert all(c["header"] for c in head), "th 必须记成表头"
+        assert [c["header"] for c in para.rows[1]] == [False, False]
+
+        # 3) 跨行跨列：字符串形式的 colspan/rowspan 要归一成整数。
+        # 1771 那格 rowspan=2，所以第 3 行只剩一个格子（第二列）。
+        assert para.rows[1][0]["rowspan"] == 2, para.rows[1][0]
+        assert para.rows[1][0]["text"] == "1771"
+        assert [c["text"] for c in para.rows[2]] == ["十一月：凯瑟琳留在鸫翔庄园。"], para.rows[2]
+        assert para.rows[3][0]["colspan"] == 2, para.rows[3][0]
+
+        # 4) 格内注码：文字留在格里，引用也留在格里（偏移相对这一格）。
+        # 与正文段同一条规矩：注码本身（"[1]"）不写进 text，而是由 refs 带着，
+        # 渲染层照 refs 在 at 处插回一个可点的链接 —— text 里再写一遍会印两次。
+        cell = para.rows[3][0]
+        assert cell["text"] == "注", cell["text"]
+        assert [r["note"] for r in cell["refs"]] == ["n1"], cell["refs"]
+        assert cell["refs"][0]["at"] == 1, cell["refs"]
+        assert cell["refs"][0]["label"] == "[1]", cell["refs"]
+
+        # 5) text 是摊平的纯文本：一行一格、行内用｜，字数统计与界面预览都靠它
+        assert para.text.splitlines()[0] == "年代｜重要事件", para.text
+        assert para.text.splitlines()[1] == "1771｜恩萧先生去利物浦，带回弃儿希斯克利夫。", para.text
+
+        # 6) 表题（<caption>）单独成段排到表前，不能悄悄消失
+        assert ch.paragraphs[0].text == "表前正文。"
+
+
+def case_table_caption_and_empty_rows() -> None:
+    """表题单独成段；没有表格的文档一切照旧（不该因为新分支改了老路径）。
+
+    另一条边界：单元格字数为 0 的行不能把整张表吞掉 —— 有些书的"表"其实是
+    用空 td 排出来的空框（版权页的方格、装饰框），全空的表渲出来只有边框，
+    但把它整张丢掉会让前后文之间凭空少一块。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        opf = _opf(
+            spine=["c1"],
+            manifest=[
+                ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        )
+        ncx = _ncx(_navpoint("第一章 开端", "Text/ch1.xhtml"))
+        entries = {
+            "OEBPS/content.opf": opf,
+            "OEBPS/toc.ncx": ncx,
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body="<h1>第一章 开端</h1>"
+                "<table><caption>表一　家族谱系</caption>"
+                "<tr><td>甲</td><td></td></tr></table>"
+                "<p>表后正文。</p>"
+            ),
+        }
+        book = read_epub(_epub(tmp, entries))
+        ch = book.chapters[0]
+        assert _kinds(ch) == ["body", "table", "body"], _kinds(ch)
+        assert ch.paragraphs[0].text == "表一　家族谱系", ch.paragraphs[0].text
+        para = ch.paragraphs[1]
+        # 空格子保留位置（第二列是空的），不是被挤掉
+        assert [c["text"] for c in para.rows[0]] == ["甲", ""], para.rows[0]
+        assert para.text == "甲", repr(para.text)
+
+
+def case_table_roundtrip() -> None:
+    """自家产物回环：build_epub 画出的表，重排回来必须是同一张网格。
+
+    回环不动点是项目契约：表格若在"写出去"或"读回来"任何一头走样，用户每
+    导入导出一次，表就烂一层 —— 这正是旧版最难受的地方（重排一次，年表变
+    成一列段落，且再也回不去）。
+    """
+    rows = [
+        [{"text": "年代", "header": True}, {"text": "艾蜜莉·布朗忒大事", "header": True}],
+        [{"text": "1817"}, {"text": "珍·奥斯汀死。"}],
+        [{"text": "1818"}, {"text": ""}],
+    ]
+    book = Book(
+        title="回环假书",
+        author="假作者",
+        source="X:/假/回环假书.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[
+                    Paragraph(text="假正文一。"),
+                    Paragraph(text="年代｜艾蜜莉·布朗忒大事\n1817｜珍·奥斯汀死。\n1818", kind="table", rows=rows),
+                    Paragraph(text="假正文二。"),
+                ],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        built = build_epub(book, modified=FIXED_MODIFIED)
+        path = tmp / "self.epub"
+        path.write_bytes(built.data)
+        back = read_epub(path)
+
+    got = [p for p in back.chapters[0].paragraphs if p.kind == "table"]
+    assert len(got) == 1, _kinds(back.chapters[0])
+    assert [[c["text"] for c in r] for r in got[0].rows] == [
+        ["年代", "艾蜜莉·布朗忒大事"],
+        ["1817", "珍·奥斯汀死。"],
+        ["1818", ""],
+    ], [[c["text"] for c in r] for r in got[0].rows]
+    assert [c["header"] for c in got[0].rows[0]] == [True, True], got[0].rows[0]
+    # 摊平文字也要一模一样（它是字数统计与界面预览的唯一来源）
+    assert got[0].text == "年代｜艾蜜莉·布朗忒大事\n1817｜珍·奥斯汀死。\n1818", got[0].text
+
+
 def main() -> int:
     cases = [
         case_epub2_basic_split,
@@ -1943,6 +2101,9 @@ def main() -> int:
         case_roundtrip_with_images,
         case_schema_v2_image_paragraph,
         case_self_roundtrip_kinds,
+        case_table_structure_kept,
+        case_table_caption_and_empty_rows,
+        case_table_roundtrip,
         case_note_number_strip_only_foreign,
         case_calibre_noteref_and_rearnote,
         case_marker_only_note_without_type_attr,

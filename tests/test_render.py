@@ -337,6 +337,37 @@ def case_global_constraints() -> None:
     assert INDENT + "没有标题的章" in _lines(text), _lines(text)
 
 
+def case_table_lines_not_indented() -> None:
+    """表格段摊成 TXT 时一行一格，且不加段首缩进。
+
+    TXT 里没有表格这回事，只能降级成"每行一条记录、格间用｜"。降级方案要
+    守住两条：行不能缩进（缩了每行都歪两格，看起来像阶梯），行尾不能留白
+    （末列为空时会出现一串没有意义的 ｜）。
+    """
+    book = _book(Chapter(title="第一章 开始", paragraphs=[
+        Paragraph(text="表前。"),
+        Paragraph(
+            text="年代｜重要事件\n1771｜恩萧先生去利物浦。\n1817",
+            kind="table",
+            rows=[
+                [{"text": "年代", "header": True}, {"text": "重要事件", "header": True}],
+                [{"text": "1771"}, {"text": "恩萧先生去利物浦。"}],
+                [{"text": "1817"}, {"text": ""}],
+            ],
+        ),
+        Paragraph(text="表后。"),
+    ]))
+    lines = _lines(render_txt(book))
+    assert "年代｜重要事件" in lines, lines
+    assert "1771｜恩萧先生去利物浦。" in lines, lines
+    # 末列为空的那一行只剩年代，不该拖一串 ｜
+    assert "1817" in lines, lines
+    assert not any(line.startswith(INDENT) and "｜" in line for line in lines), lines
+    assert not any(line.endswith("｜") for line in lines), lines
+    # 正文段的缩进不受影响：表格前后仍是正常缩进
+    assert INDENT + "表前。" in lines, lines
+
+
 def main() -> int:
     cases = [
         case_two_chapters,
@@ -354,6 +385,7 @@ def main() -> int:
         case_idempotent_no_mutation,
         case_custom_indent,
         case_line_count,
+        case_table_lines_not_indented,
         case_global_constraints,
     ]
     failed = 0

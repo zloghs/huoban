@@ -1272,9 +1272,12 @@ body {
        眼睛从行尾折回行首会找不到下一行。手机上 max-width 不生效。 */
     max-width: 40em;
     margin: 0 auto;
-    /* 章末留白：一章的最后一页不该让正文顶到屏幕最底边（贴着底边的那行
-       看着像"被切断了"，翻页时也分不清是不是还有下文）。 */
-    padding-bottom: 2.5em;
+    /* 这里**不写 padding / margin-bottom**。阅读器把 body 的盒子当"页面框"使
+       —— 十几年来 Calibre 一系的书都靠 body { margin: 0 5pt } 设页边距，不这么
+       实现的引擎读老书会全无页边距。于是 body 上的 padding 会被当成"每一页"的
+       内边距，而不是整篇文档末尾的留白：一章几十页，页页都少排一行。
+       掌阅 Tango 2 Pro 实测，2.5em 的 padding-bottom 让每页 15 行只剩 13 行。
+       CSS 里也没有 :last-page 这种选择器，"只给最后一页留白"表达不出来，索性不留。 */
 }
 
 /* 正文：2em 首行缩进是中文排版惯例；inter-ideograph 让两端对齐按字距伸缩，

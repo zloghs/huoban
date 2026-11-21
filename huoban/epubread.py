@@ -664,7 +664,10 @@ _BLOCK_TAGS = {
 }
 
 # 图说常见的 class 关键词（多看系：duokan-image-maintitle；其它书：caption 等）。
-_CAPTION_WORDS = ("maintitle", "caption", "imgtitle", "img-title", "img_caption")
+# figcap 是自家产物的类名：图说渲成 `<p class="figcap">` 而不是 figcaption ——
+# 掌阅会把 figcaption 整个元素接管（字号强制 1em、左对齐，样式表撬不动），
+# 换成 <p> 才跟得上样式表；代价是导入侧不能再靠标签名认，得靠这个类名。
+_CAPTION_WORDS = ("maintitle", "caption", "imgtitle", "img-title", "img_caption", "figcap")
 
 # 自家 EPUB 产物（epub.py 渲出）用 class 标记段落语义：verse/note/sep 全都渲成
 # <p class="...">，只看 tag 全是 p，必须靠 class 才分得回来。这是"自家产物回环

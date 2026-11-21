@@ -492,7 +492,20 @@ def case_image_ratio_classes() -> None:
             names = zf.namelist()
         for cls in ("img-tall", "img-square", "img-wide", "img-strip"):
             assert f'figure class="img {cls}"' in chap, f"缺 {cls} 档：{chap}"
-        assert "<figcaption>竖图说</figcaption>" in chap
+        assert '<p class="figcap">竖图说</p>' in chap
+        # 图说渲成 <p> 而不是 <figcaption>：掌阅把 figcaption 这个元素整个接管，
+        # 元素上的字号/对齐一律按它自己的正文来，类选择器、display:block、
+        # !important 三样都撬不动（两代写法都在真机上试过）。<p> 是它排版引擎的
+        # 基本单元，字号一定跟着样式表走。
+        assert "<figcaption" not in chap
+        assert ".figcap {\n    display: block;" in css
+        assert "p.figcap {" in css
+        assert "text-align: center !important;" in css
+        assert "font-size: 0.8em !important;" in css
+        # 逗号列表是连坐的：一条规则里塞两个选择器，弃一个等于两个都没了
+        assert "figure.img figcaption, figure.img .figcap" not in css
+        # 容器同理：纯类规则要给块级，否则没有 text-align 的作用对象
+        assert ".img {\n    display: block;" in css
         assert 'src="../Images/tall.png"' in chap
         # 图片进包，且在封面页之前
         for name in ("tall.png", "square.png", "wide.jpg", "strip.gif"):

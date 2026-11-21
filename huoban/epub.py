@@ -856,7 +856,12 @@ def _render_figure(
         return None
     cls = _image_ratio_class(p.width, p.height)
     caption = _sanitize(_text_of(p.caption))
-    cap_xml = f"<figcaption>{_esc(caption)}</figcaption>" if caption else ""
+    # 图说渲成 <p> 而不是 <figcaption>：掌阅把 figcaption 这个元素整个接管了 ——
+    # 实测字号强制 1em、左对齐，类选择器、display:block、!important 全都撬不动。
+    # <p> 是它排版引擎的基本单元（它按段落分页），字号和缩进一定跟着样式表走，
+    # 这也是 p.note 那条 0.9em 一直好使的原因。类名 figcap 让回环时还认得出
+    # 它是图说（见 epubread 的 _CAPTION_WORDS）。
+    cap_xml = f'<p class="figcap">{_esc(caption)}</p>' if caption else ""
     alt = _esc_attr(caption) if caption else ""
     # 图片路径相对章节文件（Text/chapNNNN.xhtml）向上两级？不 —— Images/ 与
     # Text/ 同级，所以在 Text/ 下用 ../Images/xxx 正好回到 OEBPS 根。
@@ -1861,7 +1866,13 @@ table.tbl tr {
    图片一律 max-width:100% + max-height:95vh —— 上限交给阅读器视口，
    一张 2480×3508 的封面式插页才不会把屏幕撑爆。
    位置原样保留在正文流里，不搬到章末：图在该出现的地方出现，是重排的底线。
-   不写 color/边框/底色：图说只是"退到背景里"的一行小字。 */
+   不写 color/边框/底色：图说只是"退到背景里"的一行小字。
+
+   为掌阅新增的主力规则只挂类名，不把 figure.img 与 .img 写进同一逗号列表：
+   掌阅碰到不认识的元素名时会丢弃整条规则，导致其中的类选择器也失效。
+   保留旧的 figure.img，供能识别该元素并支持 display 的引擎；另设 .img 给掌阅，
+   以 display:block 建立块级盒子，使 text-align 和百分比宽度有作用对象。
+   图说另见样式表末尾的说明。 */
 figure.img {
     text-indent: 0;
     text-align: center;
@@ -1870,35 +1881,74 @@ figure.img {
     break-inside: avoid;
 }
 
-figure.img img {
+/* 主力规则。display:block 是关键：掌阅把 figure 当行内未知元素处理时，
+   没有块级盒子就没有 text-align 的作用对象，图片和图说都不会居中；
+   max-width 的百分比也要块级容器才算得出来。 */
+.img {
+    display: block;
+    text-indent: 0;
+    text-align: center;
+    margin: 1.2em auto;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+
+.img img {
     max-width: 100%;
     max-height: 95vh;
     height: auto;
 }
 
-figure.img-tall {
+.img-tall {
     max-width: 60%;
 }
 
-figure.img-square {
+.img-square {
     max-width: 70%;
 }
 
-figure.img-wide {
+.img-wide {
     max-width: 90%;
 }
 
-figure.img-strip {
+.img-strip {
     max-width: 100%;
 }
 
-figcaption {
+/* 图说（图片说明）。这一块试过三代写法，前两代在掌阅里都没撬动，记下来免得
+   再走回头路：
+   一代 `figcaption { font-size }`：Calibre 生效，掌阅排成 1em、靠左。
+   二代把 `figure.img figcaption` 和 `figure.img .figcap` 塞进同一条逗号列表，
+     再加 `!important`：掌阅**毫无变化** —— 它碰到认不出的元素名会把整条规则
+     丢掉，逗号后面的类选择器跟着陪葬。
+   三代（现在）元素换成 `<p class="figcap">`（见 _render_figure），理由：掌阅把
+     figcaption 这个元素整个接管，元素的样式一律按它自己的正文来，类选择器、
+     display:block、!important 都撬不动；而 <p> 是它排版引擎的基本单元，字号
+     一定跟着样式表走（p.note 的 0.9em 一直好使就是这个道理）。
+   下面这条 .figcap 是给所有引擎的主力；p.figcap 再钉一遍，因为掌阅对
+   「元素名 + 类名」这种写法的支持最稳（注标 img.zhangyue-footnote 就是实例）。
+   font-size 用相对值：读者调大字号，图说跟着大，不会被冻住。
+   这里**不写 font-family**：掌阅把字体当阅读器级设置，作者的 font-family 一律
+   被忽略（写楷体也好、写它自带的「方正新楷体」也好，图说都跟着正文一起变），
+   写了就是死代码，还让人以为"图说该是楷体、只是没生效"。图说的区分交给字号、
+   灰色和居中，这三样掌阅都认，也不会被读者换字体冲掉。
+   不写内联 style：全书图说几百处，同一组数值复制几百遍，一漂就说不清读者
+   看到的是哪一份（注标那次踩过）。 */
+.figcap {
+    display: block;
     text-indent: 0;
     text-align: center;
-    font-family: "Kaiti SC", "STKaiti", "\u6977\u4f53", "KaiTi", serif;
-    font-size: 0.9em;
+    font-size: 0.8em;
     line-height: 1.6;
-    margin-top: 1em;
+    margin: 0.8em 0 0;
+}
+
+/* 再补一条只带 !important 的：万一阅读器自带的重置样式也带 !important，
+   同级比优先级才压得住。单独成条而不是并进上面那条 —— 有些解析器丢掉
+   不认识的 !important 声明时会连整条规则一起丢，分开放，上面那条还在。 */
+p.figcap {
+    text-align: center !important;
+    font-size: 0.8em !important;
 }
 
 /* 封面页 */
@@ -2028,7 +2078,13 @@ nav li.vol > a {
     h2.sub {
         color: #2f3d3f;
     }
-    p.note, figcaption {
+    /* 注释和图说共用一档灰。分两条规则写：掌阅会连坐丢掉含未知元素名的
+       逗号列表（`p.note, figcaption, .figcap` 被整条弃掉时，注释的颜色
+       也跟着没了）。 */
+    p.note {
+        color: #6b6b6b;
+    }
+    .figcap {
         color: #6b6b6b;
     }
     p.verse {

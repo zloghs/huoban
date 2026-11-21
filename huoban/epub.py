@@ -53,13 +53,13 @@ import io
 import re
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .fonts import BODY_FAMILY, EXTB_FAMILY, HEADING_FAMILY, FontPlan, plan_fonts
-from .model import PARAGRAPH_KINDS, Book, Chapter, Paragraph, normalize_rows
+from .model import PARAGRAPH_KINDS, Book, Chapter, Paragraph, fit_refs, normalize_rows
 
 __all__ = ["EpubResult", "build_epub", "write_epub"]
 
@@ -229,20 +229,242 @@ def _resolve_identifier(identifier, book: Book, title: str) -> str:
     return "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
+# ---------- 掌阅弹注 ----------
+
+# 注标图：包内固定叫 Images/note.png，由 tools/make_note_mark.py 生成
+# （资产登记见 docs/design-assets.md）。章节在 Text/ 下，路径要往上一级。
+_NOTE_MARK_PATH = Path(__file__).resolve().parent / "assets" / "note.png"
+_NOTE_MARK_NAME = "Images/note.png"
+_NOTE_MARK_HREF = "../" + _NOTE_MARK_NAME
+
+
+def _load_note_mark(warnings: list[str]) -> bytes | None:
+    """读注标图；读不到返回 None，注释照旧排在正文里。
+
+    降级方向是"不藏"：注文写进属性之后，这张图是它唯一的入口。图进不了包却
+    把注文塞进属性，全书注释就成了一串看不见的字 —— 宁可难看，不许丢字。
+    """
+    try:
+        data = _NOTE_MARK_PATH.read_bytes()
+    except OSError as exc:
+        warnings.append(f"读不到注标图 {_NOTE_MARK_PATH.name}（{exc}）：注释仍排在正文里，不做弹注")
+        return None
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        warnings.append(f"注标图 {_NOTE_MARK_PATH.name} 不是 PNG：注释仍排在正文里，不做弹注")
+        return None
+    return data
+
+
+def _note_text_of(para: Paragraph) -> str:
+    """一条注释的注文，压成一行。
+
+    属性里装不下段落排版，而掌阅的弹窗本来就只显示第一段 —— 与其让换行在属性
+    里变成乱码，不如在这里就压平。
+    """
+    raw = _sanitize("" if getattr(para, "text", None) is None else str(para.text))
+    return " ".join(raw.split())
+
+
+def _note_mark_html(note_text: str) -> str:
+    """掌阅弹注的入口：一张注标图，注文写在它的 zy-footnote 属性里。
+
+    掌阅不认标准的 `<a epub:type="noteref">`（在它手里只是一条普通跳转），只认
+    这套私有标记。代价是别的阅读器看到一个点不动的图标，且 `zy-footnote` 不在
+    HTML5 属性表里，EPUBCheck 会判不合法 —— 掌阅自家出的书同样如此。
+    尺寸与行内位置只由样式表 `img.zhangyue-footnote` 决定，标签上不写。
+    """
+    return (
+        f'<img class="zhangyue-footnote" src="{_NOTE_MARK_HREF}" alt="注"'
+        f' zy-footnote="{_esc_attr(note_text)}"/>'
+    )
+
+
+def _iter_book_paragraphs(book: Book):
+    """全书段落：前言、各章、后记。"""
+    yield from book.front_matter
+    for ch in book.chapters:
+        yield from ch.paragraphs
+    yield from book.tail_matter
+
+
+def _para_refs(para: Paragraph) -> list[dict]:
+    """一段里的全部行内引用：段落自己的，加上表格每一格的。"""
+    refs = [r for r in (getattr(para, "refs", None) or []) if isinstance(r, dict)]
+    if _text_of(getattr(para, "kind", "")) == "table":
+        for row in normalize_rows(getattr(para, "rows", None)):
+            for cell in row:
+                refs += [r for r in (cell.get("refs") or []) if isinstance(r, dict)]
+    return refs
+
+
+def _chapter_title_refs(ch) -> list[dict]:
+    """章节标题里的行内引用，偏移已按标题实际长度收回来。
+
+    与导入端 `Chapter.refs` 的落盘口径同源（都走 `model.fit_refs`）：存进去的
+    偏移在渲染时一定落得下，否则渲染层跳过、注文却已被搬走，等于丢注。
+    """
+    refs = [r for r in (getattr(ch, "refs", None) or []) if isinstance(r, dict)]
+    if not refs:
+        return []
+    return fit_refs(refs, _sanitize(_text_of(getattr(ch, "title", ""))))
+
+
+def _iter_book_refs(book: Book):
+    """全书**真会渲出来**的行内引用：正文段落（含表格格内）加上章节标题。
+
+    注释账必须建在这上面：漏掉哪一处，那一处的注文就会被判错一次 ——
+    要么"没人指、留在正文里"多印一遍，要么"有人指、搬进注标"但注码处渲不出，
+    两样都丢。标题注是 v5 才有的位置，很容易在遍历里被忘掉。
+    """
+    for para in _iter_book_paragraphs(book):
+        yield from _rendered_refs(para)
+    for ch in book.chapters:
+        yield from _chapter_title_refs(ch)
+
+
+def _note_plan(book: Book) -> tuple[dict[str, str], set[str], bool]:
+    """全书的注释账：锚点 → 注文、该从正文里拿掉的注释段、有没有引用自带注文。
+
+    按全书算，因为注释可能排在离引用很远的一章（Calibre 习惯把全书注释集中到
+    "注释"一章）；按章算会把跨文件的那批漏成"没人指、留在正文里"。
+
+    `consumed` 收的是**真会渲出来的**引用（见 `_iter_book_refs`）：搬走一条注文的
+    前提是注码处确实有人接着，否则那句注释就在书里凭空消失了。
+    """
+    index: dict[str, str] = {}
+    for para in _iter_book_paragraphs(book):
+        if _text_of(getattr(para, "kind", "")) != "note":
+            continue
+        anchor = _text_of(getattr(para, "anchor", ""))
+        text = _note_text_of(para)
+        if anchor and text:
+            index[anchor] = text
+
+    # 有没有自带注文的引用（掌阅格式重排回来的书就是这样）：只看有没有，
+    # 决定注标图要不要进包。走同一份"会渲出来的引用"表，标题里自带注文的
+    # 引用也算 —— 漏了它，注标图不进包，标题上的注码就变成了点不动的死文字。
+    own_text = any(_text_of(ref.get("text")) for ref in _iter_book_refs(book))
+    consumed = {
+        note
+        for ref in _iter_book_refs(book)
+        if (note := _text_of(ref.get("note"))) in index and not _text_of(ref.get("text"))
+    }
+    return index, consumed, own_text
+
+
 # ---------- 正文渲染 ----------
 
+# 拉丁字母与数字：注标右侧的空白紧挨着它们时是词间间隔，不能吞（见 _space_span）。
+_LATIN_WORD = re.compile(r"[0-9A-Za-z\u00c0-\u024f]")
 
-def _inline_html(text: str, refs: list[dict], href_of=None) -> str:
-    """把一段文字渲成 HTML，顺便把行内引用（[1] 这类）变成可点开的链接。
 
-    为什么值得单独做：EPUB 的"弹注"不是靠一段注释文字，而是靠
-    正文里的 `<a epub:type="noteref" href="#id">` 指向注释块的 id。
-    没有这层链接，注释就只是一堆排在章末的普通段落，阅读器不会弹窗，
-    读者也没法从正文跳过去 —— 实测的"弹注全部失效"就是这个原因。
+def _space_span(text: str, at: int, floor: int) -> tuple[int, int]:
+    """注标两侧该吞掉的空白，返回 (左边界, 右边界)。
 
-    href_of 决定链接指向哪儿：注释在别的章节文件里时必须是
-    `chap0007.xhtml#id`，只写 `#id` 会跳到当前章里一个不存在的锚点。
-    它返回 None 表示"这个落点全书都找不到"，那就只留文字不留链接。
+    注码常被写成 `他说完。 [1] 屋里静下来`、`山顶的Hall [4]`，注码换成注标图
+    之后，那些空白就成了注标左右凭空多出来的空隙。
+
+    **左边一律吞**：注标贴着前一个字，中文本来不留字距，英文的注码也紧跟在词尾。
+    **右边只在后面不是拉丁词时才吞**：那格空白在中文里同样是排版噪声，在英文里
+    却是词间间隔，吞掉就成了 `notehere`。空白按 Unicode 算 —— 半角空格、`\u3000`
+    （全角空格）、不间断空格都算，中文书里全角空格比半角更常见。
+    """
+    left = at
+    while left > floor and text[left - 1].isspace():
+        left -= 1
+    right = at
+    while right < len(text) and text[right].isspace():
+        right += 1
+    if right < len(text) and _LATIN_WORD.match(text[right]):
+        right = at
+    return left, right
+
+
+def _para_lines(para: Paragraph) -> list[tuple[str, Paragraph | None]]:
+    """把段落拆成物理行，并把 refs 的偏移换算到各自的行内。
+
+    refs 的 at 是"整段"的字符偏移，渲进版面时一段可能被拆成几个 <p>（脏中间态
+    里混进了裸换行），行首行尾的空白又会被 strip 掉。不换算的后果不是"少一个
+    链接"，而是**丢字**：越界的那条引用被跳过，可它的注文已经按"这条引用在"
+    从正文里搬走了 —— 书里一个字都不剩（真书上发生过，见 test_epub 的
+    `case_note_ref_survives_line_strip`）。
+
+    返回 [(行文本, 该行该用的段落)]：空行给 None，什么都不用改的常态行给原对象
+    （一本书上万段，能不造副本就不造）。anchor 只挂在第一行身上 —— 多行共用
+    一个 id 会在同一个章节文件里造出重复 id。
+    """
+    raw = _sanitize("" if para.text is None else str(para.text))
+    refs = [r for r in (getattr(para, "refs", None) or []) if isinstance(r, dict)]
+    anchor = _text_of(getattr(para, "anchor", ""))
+    lines = raw.splitlines() or [""]
+    out: list[tuple[str, Paragraph | None]] = []
+    pos = 0
+    for index, line in enumerate(lines):
+        head = raw.find(line, pos)  # 行是原文的切片，从上一行末尾往后找一定命中
+        if head < 0:
+            head, line = pos, raw[pos:]
+        pos = head + len(line)
+        lead = len(line) - len(line.lstrip())
+        text = line.strip()
+        if not text:
+            out.append(("", None))
+            continue
+        body_at = head + lead
+        own: list[dict] = []
+        for ref in refs:
+            try:
+                at = int(ref.get("at", 0))
+            except (TypeError, ValueError):
+                continue
+            if head <= at <= head + len(line):
+                # 落在被 strip 掉的那截空白里（行首缩进、行尾空格）就贴到边上：
+                # "插在段末空格之后"与"插在最后一个字之后"是同一个位置。
+                own.append({**ref, "at": min(max(at - body_at, 0), len(text))})
+        if len(lines) == 1 and text == raw and own == refs:
+            out.append((text, para))
+        else:
+            out.append(
+                (text, replace(para, text=text, refs=own, anchor=anchor if index == 0 else ""))
+            )
+    return out
+
+
+def _rendered_refs(para: Paragraph) -> list[dict]:
+    """本段真正会渲出来的引用（与 `_para_lines` 同一套换算）。
+
+    决定"哪条注文可以搬进注标"时只能用这个，不能用原始 refs：原始列表里可能
+    有一条落在被 strip 掉的空白上、或者根本放不进行里，它渲不出来，而注文却已经
+    被搬走了。表格与注释段之外没有别的特殊通道 —— 章节标题另走
+    `_chapter_title_refs`（它不在段落列表里）。
+    """
+    kind = _text_of(getattr(para, "kind", "")) or "body"
+    if kind in ("blank", "image", "sep"):
+        return []
+    if kind == "table":
+        return _para_refs(para)  # 单元格文本不 strip，偏移原样可用
+    if kind == "note":
+        # 注释段自己也可能带引用（回指正文的反向链接）。它会不会渲出来取决于
+        # 它有没有被搬走，那是另一个循环的判断；按"不渲"算，宁可留一段重复的
+        # 注文，也不能把它指向的注搬走却没人接。
+        return []
+    out: list[dict] = []
+    for _, line_para in _para_lines(para):
+        if line_para is not None:
+            out.extend(line_para.refs)
+    return out
+
+
+def _inline_html(text: str, refs: list[dict], href_of=None, note_of=None) -> str:
+    """把一段文字渲成 HTML，行内引用（[1] 这类）按有没有注文分两条路：
+
+    - **有注文**（引用自带 `text`，或 `note_of` 从全书注释表里查到落点）→ 渲成
+      掌阅注标图，注文进属性，正文里不留任何注释文字；
+    - **没注文**（落点找不到、或注标图缺席）→ 有落点就渲成可点链接，没有就只留
+      显示文字。
+
+    href_of 给出链接的指向：注释在别的章节文件里时必须是 `chap0007.xhtml#id`，
+    只写 `#id` 会跳到当前章一个不存在的锚点；返回 None 表示落点全书都找不到。
+    note_of 只在注标图进得了包时才有值 —— 没有图就没有入口，藏起来等于丢字。
 
     refs 的 at 是"插在第 at 个字符之前"。越界/逆序的条目一律跳过而不是钳制：
     钳制会把链接插到错误的位置，读者点开看到的是别的注，比点不开更糟。
@@ -256,8 +478,20 @@ def _inline_html(text: str, refs: list[dict], href_of=None) -> str:
             at = int(ref.get("at", 0))
         except (TypeError, ValueError):
             continue
+        if at < pos or at > len(text):
+            continue
         note = _text_of(ref.get("note"))
-        if at < pos or at > len(text) or not note:
+        note_text = ""
+        if note_of is not None:
+            note_text = _text_of(ref.get("text")) or _text_of(note_of(note))
+        if not note and not note_text:
+            continue
+        if note_text:
+            # 注码被换成图之后，前后那几个空格就是注标左右凭空多出来的空白。
+            left, right = _space_span(text, at, pos)
+            parts.append(_esc(text[pos:left]))
+            parts.append(_note_mark_html(note_text))
+            pos = right
             continue
         parts.append(_esc(text[pos:at]))
         label = _text_of(ref.get("label")) or "·"
@@ -276,12 +510,13 @@ def _inline_html(text: str, refs: list[dict], href_of=None) -> str:
 
 
 def _para_html(
-    tag: str, text: str, para: "Paragraph | None", cls: str, href_of=None
+    tag: str, text: str, para: "Paragraph | None", cls: str, href_of=None, note_of=None
 ) -> str:
     """渲一个段落元素，带上 id（被链接的落点）与行内引用。
 
-    note 段额外带 epub:type="footnote"：这是阅读器判断"这是一条注"的依据，
-    只有它存在时正文里的 noteref 才会被当成弹注而不是普通跳转。
+    note 段额外带 epub:type="footnote"：这是"这是条注"的语义标记。走正常
+    路径时这类段落根本不会渲出来（注文已进属性），留着它的是那条退路 ——
+    注标图缺席、注释只能照旧排在正文里时，正文里的 noteref 还得靠它才像条注。
     """
     attrs = f' class="{cls}"' if cls else ""
     anchor = _text_of(getattr(para, "anchor", "")) if para is not None else ""
@@ -290,7 +525,7 @@ def _para_html(
         if cls == "note":
             attrs += ' epub:type="footnote"'
     refs = list(getattr(para, "refs", []) or []) if para is not None else []
-    return f"<{tag}{attrs}>{_inline_html(text, refs, href_of)}</{tag}>\n"
+    return f"<{tag}{attrs}>{_inline_html(text, refs, href_of, note_of)}</{tag}>\n"
 
 
 def _render_paragraphs(
@@ -301,6 +536,8 @@ def _render_paragraphs(
     front: bool = False,
     images_ok: set[str] | None = None,
     href_of=None,
+    note_of=None,
+    hidden_notes: set[str] | None = None,
 ) -> tuple[str, int]:
     """把一串段落渲染成 xhtml 片段，返回 (片段, 已写入的元素个数)。
 
@@ -316,6 +553,8 @@ def _render_paragraphs(
        每章开头凭空多出一块空白。
     4. 每行文本 strip：中文小说里的行首空白只可能是排版残留（清洗层归一后的
        两个全角空格），而缩进由 CSS 的 text-indent 负责，留着会变成四格缩进。
+       拆行与 strip 会动字符偏移，refs 的坐标因此统一交给 `_para_lines` 换算 ——
+       不换算就会把注码判成越界（注文却已被搬走，等于丢字）。
 
     front=True 时多一条排版规则：**短行**（不超过 24 字、且不以句末标点收尾）
     按"书名页"样式居中不缩进。理由是真实样本里书的前言区往往就是
@@ -333,6 +572,11 @@ def _render_paragraphs(
     "这句是作者注"还是"漏了缩进的正文"。成组之后由 CSS 画一条中灰分隔线，
     视觉上才是一块"注释区"。不加上标编号：章节树里已经丢了引用处的锚点，
     造不出"第 N 条注对应正文哪个位置"的对应关系，硬编号等于编数据。
+
+    **被注码指到的注释段不再渲进正文**：注文已随注码写进注标属性（见
+    `_note_plan`），再排一遍就是把注文印两遍。`hidden_notes` 是这批段的锚点集；
+    没被指到的（清洗出来的按语、丢了注码的孤儿注）照旧成组排出 —— 藏起一段
+    没人能打开的文字，等于删字。
     """
     # 契约外的 kind 只报一次，按正文处理：脏中间态优先能出包，让用户先看到书。
     bad_kinds = sorted({_text_of(p.kind) for p in paragraphs if _text_of(p.kind) not in PARAGRAPH_KINDS})
@@ -348,8 +592,17 @@ def _render_paragraphs(
     items: list[tuple[str, object, Paragraph | None]] = []
     for p in paragraphs:
         kind = _text_of(p.kind) or "body"
+        if kind == "note" and _text_of(getattr(p, "anchor", "")) in (hidden_notes or ()):
+            continue
         if kind == "blank":
             items.append(("gap", "", None))
+            continue
+        if not _text_of(p.text).strip() and getattr(p, "refs", None):
+            # 没有文字、只剩注码的段：空行会把 refs 一起吞掉。这种段是
+            # 导入端的退路 —— 前言里的重复标题被剔除时，标题上的注码落在这里
+            # （见 epubread._carry_refs）。正文章节的标题注存进 Chapter.refs，
+            # 不走这条路；只有前言没有章节实体可挂。
+            items.append((kind, "", p))
             continue
         if kind == "image":
             items.append(("image", p, p))
@@ -369,17 +622,11 @@ def _render_paragraphs(
             continue
         if kind not in _ELEMENT_BY_KIND:
             kind = "body"
-        raw = _sanitize("" if p.text is None else str(p.text))
-        # splitlines() 对 "" 返回 []，所以退化成一行空串 —— 空段照样算一个空行。
-        lines = raw.splitlines() or [""]
-        # refs 的 at 是"整段"的字符偏移；段被拆成多行时偏移就对不上了。
-        # 这种情况只可能出现在脏中间态（手改 JSON 塞了换行），
-        # 宁可退化成没有链接的纯文本，也不能把链接插到错误的位置。
-        keep = p if len(lines) == 1 and p.refs else (p if p.anchor else None)
-        for line in lines:
-            line = line.strip()
+        # 拆行与 refs 的坐标换算都在 _para_lines 里（行首行尾空白会被 strip，
+        # 偏移必须跟着减，否则那条注码会被判成越界）。
+        for line, line_para in _para_lines(p):
             if line:
-                items.append((kind, line, keep))
+                items.append((kind, line, line_para))
             else:
                 items.append(("gap", "", None))
 
@@ -445,7 +692,7 @@ def _render_paragraphs(
             i += 1
             continue
         if kind == "table":
-            table = _render_table(para, warnings, where, href_of)  # type: ignore[arg-type]
+            table = _render_table(para, warnings, where, href_of, note_of)  # type: ignore[arg-type]
             if table:
                 out.append(table)
                 count += 1
@@ -458,7 +705,7 @@ def _render_paragraphs(
             while j < len(squeezed) and squeezed[j][0] == "note":
                 j += 1
             inner = "".join(
-                _para_html("p", t, pr, "note", href_of) for _, t, pr in squeezed[i:j]
+                _para_html("p", t, pr, "note", href_of, note_of) for _, t, pr in squeezed[i:j]
             )
             out.append(f'<div class="notes">\n{inner}</div>\n')
             count += j - i
@@ -468,12 +715,12 @@ def _render_paragraphs(
         # 换成 .front-title 会让它们同时丢掉 .sub/.note 又匹配不到
         # p.front-title，退化成浏览器默认的又大又粗。
         if front and kind == "body" and _is_title_page_line(text):
-            out.append(_para_html("p", text, para, "front-title", href_of))
+            out.append(_para_html("p", text, para, "front-title", href_of, note_of))
             count += 1
             i += 1
             continue
         tag, cls = _ELEMENT_BY_KIND[kind]
-        out.append(_para_html(tag, text, para, cls, href_of))
+        out.append(_para_html(tag, text, para, cls, href_of, note_of))
         count += 1
         i += 1
     return "".join(out), count
@@ -510,6 +757,7 @@ def _render_table(
     warnings: list[str],
     where: str,
     href_of=None,
+    note_of=None,
 ) -> str | None:
     """把一个 table 段渲成 <table>；网格是空的就返回 None。
 
@@ -547,7 +795,7 @@ def _render_table(
             if cell["anchor"]:
                 attrs += f' id="{_esc_attr(cell["anchor"])}"'
             text = _sanitize(cell["text"])
-            cells.append(f"<{tag}{attrs}>{_inline_html(text, cell['refs'], href_of)}</{tag}>")
+            cells.append(f"<{tag}{attrs}>{_inline_html(text, cell["refs"], href_of, note_of)}</{tag}>")
         out.append("  <tr>" + "".join(cells) + "</tr>\n")
     out.append("</table>\n")
     return "".join(out)
@@ -674,6 +922,8 @@ def _render_chapters(
     warnings: list[str],
     *,
     images_ok: set[str] | None = None,
+    note_of=None,
+    hidden_notes: set[str] | None = None,
 ) -> tuple[list[tuple[str, str, str]], int]:
     """渲染所有章节文件，返回 ([(包内路径, 标题, 文档文本)], 段落总数)。
 
@@ -705,11 +955,11 @@ def _render_chapters(
 
         front_xml, front_count = _render_paragraphs(
             book.front_matter, warnings, "正文部分", front=True, images_ok=images_ok,
-            href_of=_href_here,
+            href_of=_href_here, note_of=note_of, hidden_notes=hidden_notes,
         )
         tail_xml, tail_count = _render_paragraphs(
             book.tail_matter, warnings, "正文部分", images_ok=images_ok,
-            href_of=_href_here,
+            href_of=_href_here, note_of=note_of, hidden_notes=hidden_notes,
         )
         title_text = _sanitize(_text_of(book_title)) or "正文"
         doc = _xhtml_doc(lang, title_text, front_xml + tail_xml, "../Styles/main.css")
@@ -771,10 +1021,12 @@ def _render_chapters(
     front_xml, front_count = _render_paragraphs(
         book.front_matter, warnings, "前言部分", front=True, images_ok=images_ok,
         href_of=_href_maker(_chapter_filename(front_at)),
+        note_of=note_of, hidden_notes=hidden_notes,
     )
     tail_xml, tail_count = _render_paragraphs(
         book.tail_matter, warnings, "后记部分", images_ok=images_ok,
         href_of=_href_maker(_chapter_filename(last)),
+        note_of=note_of, hidden_notes=hidden_notes,
     )
     for idx, ch in enumerate(book.chapters, start=1):
         where = f"第 {idx} 个章节"
@@ -786,15 +1038,41 @@ def _render_chapters(
         # h1 一律写在文件里（需求：标题文本必须能在章节文件里找到）。
         # level=2 的卷/部标题用 .vol 加大字号与留白 —— 它是"分卷"这种大结构。
         cls = ' class="vol"' if level == 2 else ""
-        body = f"<h1{cls}>{_esc(title_text)}</h1>\n"
+        # 标题里的注码与正文走同一套渲染（注文进注标属性）：源书把注标写进
+        # `<h1>` 时，注码本来就在标题末尾，不必再挪到正文第一句去。没有标题注
+        # 的章节退化成纯转义，产物与旧版逐字节一致。
+        title_html = _inline_html(
+            title_text,
+            _chapter_title_refs(ch),
+            href_of=_href_maker(_chapter_filename(idx)),
+            note_of=note_of,
+        )
+        body = f"<h1{cls}>{title_html}</h1>\n"
 
         if idx == front_at and front_xml:
             # 前言放在章标题之前：它是整本书的开场，不能躲在第一章标题下面。
             body = front_xml + body
 
+        # 整章的注文都被搬进注码时提醒一句：Calibre 系的书常把全书注释集中成
+        # 一章（标题「注释」），搬完就剩个标题 —— 读者翻到这儿会看到一页空白，
+        # 不说一声他只会以为书坏了。章本身不动：删一章要改 nav/ncx 的索引映射，
+        # 那是另一件事。
+        if ch.paragraphs and not [
+            p for p in ch.paragraphs
+            if not (
+                _text_of(getattr(p, "kind", "")) == "note"
+                and _text_of(getattr(p, "anchor", "")) in (hidden_notes or ())
+            )
+        ]:
+            warnings.append(
+                f"{where}的 {len(ch.paragraphs)} 段全是注释，注文已经搬进注码："
+                "打包后这一章只剩标题"
+            )
+
         ch_xml, ch_count = _render_paragraphs(
             ch.paragraphs, warnings, where, images_ok=images_ok,
             href_of=_href_maker(_chapter_filename(idx)),
+            note_of=note_of, hidden_notes=hidden_notes,
         )
         body += ch_xml
         body_paragraphs += ch_count
@@ -1105,6 +1383,7 @@ def _opf_doc(
     chapter_docs: list[tuple[str, str, str]],
     font_items: list[tuple[str, str, str]] = (),
     image_items: list[tuple[str, str, str]] = (),
+    note_mark: bool = False,
 ) -> str:
     """content.opf：EPUB3 的清单，同时补 EPUB2 的 spine@toc 与 guide。
 
@@ -1174,6 +1453,13 @@ def _opf_doc(
         lines.append(
             f'    <item id="{_esc_attr(img_id)}" href="{_esc_attr(href)}"'
             f' media-type="{_esc_attr(media)}"/>'
+        )
+    # 掌阅注标图（见 _note_mark_html）：只有真渲出了注标才进 manifest ——
+    # 包里挂一张没人引用的图，EPUBCheck 会按"多余资源"报出来。
+    if note_mark:
+        lines.append(
+            f'    <item id="note-mark" href="{_esc_attr(_NOTE_MARK_NAME)}"'
+            ' media-type="image/png"/>'
         )
     for idx, (path, _title, _doc) in enumerate(chapter_docs, start=1):
         lines.append(
@@ -1355,6 +1641,23 @@ p.note {
     font-size: 0.9em;
     line-height: 1.7;
     margin: 0.5em 0;
+}
+
+/* 掌阅弹注的入口（见 _note_mark_html）：一张 0.9em 的注标图，注文在属性里。
+   尺寸只在这一块 —— 标签上不写 style / width / height：全书注标成百上千，
+   内联等于把同一组数值复制几百遍，还会反过来盖住这块。
+   不套外框（margin / padding 为 0）：整块比一个汉字略窄，牌面那圈空白就是
+   它和邻居的距离，再补一层内边距只会把图缩小、把占位加宽。
+   写死尺寸，不交给阅读器（它会缩到看不清）；vertical-align 用长度值而不是
+   super —— super 按行高抬，带注标的行会比别的行松。
+   图是"深灰牌 + 白「注」"（见 tools/make_note_mark.py），深浅页面共用一张。 */
+img.zhangyue-footnote {
+    width: 0.9em;
+    height: 0.9em;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    vertical-align: 0.35em;
 }
 
 /* 注释区：连续的 note 段由渲染层成组包进 <div class="notes">（见
@@ -2066,8 +2369,18 @@ def build_epub(
     # "哪些图片文件真的存在"，否则会写出一堆指向空文件的 <img>（裂图）。
     chapter_images = _load_chapter_images(book, image_dir, warnings)
     images_ok = set(chapter_images)
+    # 掌阅弹注：注文从注释段搬进注标的属性，注释段随之从正文里消失。注标图读
+    # 不到就整条路退回老做法（见 _load_note_mark）。这两件事必须在渲染之前定
+    # 下来 —— 渲染时才知道该隐哪几段。
+    note_mark = _load_note_mark(warnings)
+    note_index, hidden_notes, own_text = (
+        _note_plan(book) if note_mark is not None else ({}, set(), False)
+    )
+    note_mark_used = note_mark is not None and (bool(hidden_notes) or own_text)
     chapter_docs, paragraph_count = _render_chapters(
-        book, lang, book_title, warnings, images_ok=images_ok
+        book, lang, book_title, warnings, images_ok=images_ok,
+        note_of=note_index.get if note_mark_used else None,
+        hidden_notes=hidden_notes,
     )
 
     cover_name, cover_media = (cover[0], cover[1]) if cover else (None, None)
@@ -2125,6 +2438,7 @@ def build_epub(
         chapter_docs=chapter_docs,
         font_items=font_items,
         image_items=image_items,
+        note_mark=note_mark_used,
     )
     _selfcheck("content.opf", opf, warnings, strict=True)
 
@@ -2165,6 +2479,10 @@ def build_epub(
     # 这里放的是**路径**而不是字节：真正的读发生在 _zip_bytes 里，一张写完就放手。
     for name, (src, _media) in chapter_images.items():
         entries.append((f"OEBPS/Images/{name}", src, True))
+    # 注标图跟在章节内图片之后：Images/ 下的条目排在一起，人工核对包里
+    # 有什么图时不用来回跳。
+    if note_mark_used:
+        entries.append((f"OEBPS/{_NOTE_MARK_NAME}", note_mark, True))
     entries.append(("OEBPS/Text/cover.xhtml", cover_doc.encode("utf-8"), True))
     for path, _title, doc in chapter_docs:
         entries.append((f"OEBPS/{path}", doc.encode("utf-8"), True))

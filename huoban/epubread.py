@@ -812,8 +812,10 @@ class _DocParser(html.parser.HTMLParser):
     ParseError；html.parser 是容错的，坏文档也能尽量抠出内容。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, key=None) -> None:
         super().__init__(convert_charrefs=True)
+        # 引用目标 → 全书唯一键。None 时按"只取片段名"处理（单篇解析的旧行为）。
+        self._key = key or (lambda href: href.split("#", 1)[1].strip() if "#" in href else "")
         self.items: list[list] = []
         # 每帧：[tag, attrs, 文本缓冲, 有子块, 有图, 行内引用, 是注释容器]
         self._frames: list[list] = []
@@ -1143,7 +1145,7 @@ class _DocParser(html.parser.HTMLParser):
             href = (a.get("href") or "").strip()
             if tag == "a" and "#" in href:
                 self._ref = {
-                    "frag": href.split("#", 1)[1].strip(),
+                    "frag": self._key(href),
                     "buf": [],
                     "cand": False,
                 }
@@ -1155,7 +1157,7 @@ class _DocParser(html.parser.HTMLParser):
         # 没有落点，交给 _resolve_refs 还原成纯文字，不硬造死链接。
         if tag == "a":
             href = (a.get("href") or "").strip()
-            frag = href.split("#", 1)[1].strip() if "#" in href else ""
+            frag = self._key(href)
             if "noteref" in _type_words(a):
                 self._ref = {"frag": frag, "buf": [], "cand": False}
                 return
@@ -1521,11 +1523,137 @@ def _drop_unreferenced_anchors(book) -> int:
     return dropped
 
 
-def _parse_doc(data: bytes) -> list[list]:
-    parser = _DocParser()
+# ---------- 锚点命名空间 ----------
+
+# 解析期把"某份源文件里的某个片段"写成 `文件␟片段`。没有这一层，全书只按片段名
+# 索引锚点：一章一文件的书每章都从 note_1 编号，凑成一张表就互相覆盖，正文的注码
+# 全部指到同一批注文上（《谁的问题》103 条注文只剩 7 种）。␟ 是控制字符，正文里
+# 不会出现，也不动 atom 的 id 规则 —— 它只活在解析期，进 Book 之前就摘掉。
+_NS = "\x1f"
+
+
+def _doc_slug(name: str) -> str:
+    """源文件名 → 可作 id 前缀的短名（OEBPS/Text/part0008.xhtml → part0008）。"""
+    stem = posixpath.splitext(posixpath.basename(name or ""))[0]
+    return re.sub(r"[^0-9A-Za-z_-]+", "-", stem).strip("-") or "doc"
+
+
+def _doc_key(name: str, resolve):
+    """构造「本文件里的 href → 全书唯一锚点键」。
+
+    空片段（`href="chapter2.xhtml"`，目录链接那种）返回空串 —— 它不是锚点引用，
+    调用方据此把它当普通链接还原成文字。
+    """
+    here = posixpath.dirname(name)
+
+    def key(href: str) -> str:
+        href = (href or "").strip()
+        if not href:
+            return ""
+        path, _, frag = href.partition("#")
+        frag = frag.strip()
+        if not frag:
+            return ""
+        doc = name if not path else (resolve(path, here) or path)
+        return f"{doc}{_NS}{frag}"
+
+    return key
+
+
+def _namespace_items(items: list[list], key) -> None:
+    """给本篇的锚点（段落、表格格）套上同样的命名空间。"""
+    for item in items:
+        if item[0] == "anchor":
+            if item[1]:
+                item[1] = key("#" + item[1])
+        elif item[0] == "table":
+            for row in item[1]:
+                for cell in row:
+                    if cell.get("anchor"):
+                        cell["anchor"] = key("#" + cell["anchor"])
+
+
+def _iter_anchor_keys(book):
+    """遍历全书所有锚点与引用目标（解析期的复合键）。"""
+    for para in _iter_paragraphs(book):
+        yield para.anchor
+        for ref in para.refs or []:
+            if isinstance(ref, dict):
+                yield ref.get("note")
+        for cell in _iter_cells(para):
+            yield cell.get("anchor")
+            for ref in cell.get("refs") or []:
+                if isinstance(ref, dict):
+                    yield ref.get("note")
+    for ch in book.chapters:
+        for ref in getattr(ch, "refs", None) or []:
+            if isinstance(ref, dict):
+                yield ref.get("note")
+
+
+def _localize_anchors(book) -> None:
+    """把解析期的「文件␟片段」复合键收缩成最终 id。
+
+    规则只有一条：某个片段名全书只在一份源文件里出现过，就去掉前缀、原样留下；
+    多份文件都有同名片段时，各加自己的文件前缀（part0008-note_1）。这样既能让
+    每章的 note_1 各归各位，又不至于让自家产物重新导入时 id 越串越长 —— 产物里
+    的 id 已经唯一，第二趟走的正是"原样留下"这条，回环不动点保住。
+    """
+    owners: dict[str, set[str]] = {}
+    for key in _iter_anchor_keys(book):
+        if not key or _NS not in key:
+            continue
+        doc, _, frag = key.partition(_NS)
+        if frag:
+            owners.setdefault(frag, set()).add(doc)
+
+    prefix: dict[str, str] = {}
+    taken: set[str] = set()
+    for frag, docs in owners.items():
+        if len(docs) < 2:
+            continue
+        for doc in sorted(docs):
+            if doc in prefix:
+                continue
+            base = _doc_slug(doc)
+            name, n = base, 2
+            while name in taken:
+                name, n = f"{base}{n}", n + 1
+            prefix[doc] = name
+            taken.add(name)
+
+    def final(key: str) -> str:
+        if not key or _NS not in key:
+            return key
+        doc, _, frag = key.partition(_NS)
+        if len(owners.get(frag) or ()) < 2:
+            return frag
+        return f"{prefix.get(doc) or _doc_slug(doc)}-{frag}"
+
+    def fix_refs(refs) -> None:
+        for ref in refs or []:
+            if isinstance(ref, dict) and ref.get("note"):
+                ref["note"] = final(ref["note"])
+
+    for para in _iter_paragraphs(book):
+        if para.anchor:
+            para.anchor = final(para.anchor)
+        fix_refs(para.refs)
+        for cell in _iter_cells(para):
+            if cell.get("anchor"):
+                cell["anchor"] = final(cell["anchor"])
+            fix_refs(cell.get("refs"))
+    for ch in book.chapters:
+        fix_refs(getattr(ch, "refs", None))
+
+
+def _parse_doc(data: bytes, key=None) -> list[list]:
+    parser = _DocParser(key)
     parser.feed(data.decode("utf-8", "replace"))
     parser.close()
     items = parser.items
+    if key is not None:
+        _namespace_items(items, key)
     _resolve_refs(items)
     return items
 
@@ -1561,17 +1689,20 @@ def _is_toc_title(title: str) -> bool:
     return bool(key) and (key in _TOC_WORDS or (key.startswith("目录") and len(key) <= 4))
 
 
-def _split_positions(items: list[list], nodes: list[_NavNode]) -> list[int]:
+def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list[int]:
     """算出每个目录节点在 items 里的起始下标（单调不减）。
 
     正常情况靠 #anchor 定位；锚点丢了（破损/改名）就在相邻已知锚点之间
     均分 —— 宁可切得粗糙，也不能让第一个节点吞掉整篇、其余全是空章。
+    `key` 与解析时用的是同一份：items 里的锚点已带文件命名空间，目录片段
+    也要换成同一种键才比得上。
     """
     # 一个文档只对应一个目录节点、又没有 #fragment（绝大多数"一文件一章"的书
     # 都是这样，包括本工具自己打出来的 EPUB）：整篇文档都属于它，从 0 开始。
     # 不特殊处理的话下面的均分会把它从中间劈开，前半截被塞给上一章。
     if len(nodes) == 1 and not nodes[0].fragment:
         return [0]
+    to_key = key or (lambda frag: frag)
     anchor_at: dict[str, int] = {}
     for idx, item in enumerate(items):
         if item[0] == "anchor":
@@ -1579,8 +1710,9 @@ def _split_positions(items: list[list], nodes: list[_NavNode]) -> list[int]:
     pos: list[int | None] = [None] * len(nodes)
     prev = 0
     for i, node in enumerate(nodes):
-        if node.fragment and node.fragment in anchor_at and anchor_at[node.fragment] >= prev:
-            pos[i] = anchor_at[node.fragment]
+        want = to_key("#" + node.fragment) if node.fragment else ""
+        if want and want in anchor_at and anchor_at[want] >= prev:
+            pos[i] = anchor_at[want]
             prev = pos[i]
     i = 0
     while i < len(nodes):
@@ -2134,7 +2266,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
             except KeyError:
                 continue
             if _is_generated_page(items):
@@ -2164,7 +2296,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
             except KeyError:
                 continue
             nodes = nodes_by_doc.get(name, [])
@@ -2180,7 +2312,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continuation_docs += 1
                 _emit(items)
                 continue
-            positions = _split_positions(items, nodes)
+            positions = _split_positions(items, nodes, _doc_key(name, resolve))
             if positions and positions[0] > 0:
                 _emit(items[: positions[0]])
             for i, node in enumerate(nodes):
@@ -2250,6 +2382,10 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         chapters=merged,
         tail_matter=[],
     )
+    # 锚点的文件命名空间收掉：同名片段按文件分流，否则全书的 note_1 会认成
+    # 同一个落点（见 _localize_anchors）。必须排在 _finalize_refs 之前 ——
+    # 那一趟要靠最终 id 判"这个引用的落点到底在不在"。
+    _localize_anchors(book)
     # 全书都解析完了，现在才有资格判"这个引用指向的注释到底在不在"。
     _finalize_refs(book)
     # 引用裁完之后，反过来把没人指向的 id 清掉（Kobo 的 kobo.*、版式容器的

@@ -2260,6 +2260,66 @@ def case_table_roundtrip() -> None:
     assert got[0].text == "年代｜艾蜜莉·布朗忒大事\n1817｜珍·奥斯汀死。\n1818", got[0].text
 
 
+def case_same_fragment_name_in_two_chapters() -> None:
+    """两章各自从 note_1 起编号：注文不能串成一锅。
+
+    一章一文件的书，每章注释都从 note_1 重新编号（《谁的问题》15 章各一套）。
+    锚点只按片段名索引时，全书凑成一个字典同名互相覆盖：103 条注文只剩 7 种，
+    读者点开注码看到的是别章的文献 —— 比缺字更糟。修复后各章的 note_1 按
+    源文件分流（ch1-note_1 / ch2-note_1），互不干扰。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        def page(n: int, note: str) -> str:
+            return XHTML.format(
+                body=(
+                    f'<h2 id="h{n}">第{n}章 起</h2>'
+                    f'<p>正文{n}<a type="noteref" href="#note_1">[1]</a>继续。</p>'
+                    f'<aside id="note_1"><p>'
+                    f'<a type="noteref" href="#h{n}">[1]</a>{note}</p></aside>'
+                )
+            )
+
+        path = _epub(
+            tmp,
+            {
+                "OEBPS/content.opf": _opf(
+                    spine=["c1", "c2"],
+                    manifest=[
+                        ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                        ("c2", "Text/ch2.xhtml", "application/xhtml+xml", ""),
+                        ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                    ],
+                ),
+                "OEBPS/toc.ncx": _ncx(
+                    _navpoint("第1章 起", "Text/ch1.xhtml")
+                    + _navpoint("第2章 起", "Text/ch2.xhtml")
+                ),
+                "OEBPS/Text/ch1.xhtml": page(1, "甲的注文。"),
+                "OEBPS/Text/ch2.xhtml": page(2, "乙的注文。"),
+            },
+        )
+        book = read_epub(path)
+        allp = _all_paragraphs(book)
+        notes = [p for p in allp if p.kind == "note"]
+        assert [p.text for p in notes] == ["甲的注文。", "乙的注文。"], [p.text for p in notes]
+        # 同名片段在不同文件里，锚点必须分成两个
+        assert len({p.anchor for p in notes}) == 2, [p.anchor for p in notes]
+        assert all(p.anchor.endswith("note_1") for p in notes), [p.anchor for p in notes]
+        # 每章的注码要指回本章那条，而不是全指到最后一条
+        body_refs = [r["note"] for p in allp if p.kind == "body" for r in (p.refs or [])]
+        assert body_refs == [p.anchor for p in notes], (body_refs, [p.anchor for p in notes])
+
+        # 打包后每条注文仍落在自己的注标上（不再退化成同一条）
+        data = build_epub(book, modified=FIXED_MODIFIED).data
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            text = "".join(
+                zf.read(n).decode("utf-8") for n in zf.namelist() if n.endswith(".xhtml")
+            )
+        assert 'zy-footnote="甲的注文。"' in text and 'zy-footnote="乙的注文。"' in text, text
+
+
 def case_zhangyue_footnote_roundtrip() -> None:
     """掌阅弹注回环：注文在注标图的属性里，重排必须把它读回成一条自带注文的引用。
 
@@ -2396,6 +2456,7 @@ def main() -> int:
         case_table_caption_and_empty_rows,
         case_table_roundtrip,
         case_zhangyue_footnote_roundtrip,
+        case_same_fragment_name_in_two_chapters,
         case_report_source_is_the_file_path,
         case_zhangyue_mark_is_not_a_picture,
         case_title_note_stays_on_chapter,

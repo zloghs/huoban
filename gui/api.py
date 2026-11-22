@@ -1220,8 +1220,8 @@ def _detail_chap(session, row: dict) -> dict:
             left.append({"t": "……另有 %d 段" % (len(front) - 3), "cls": "more"})
         left.append({"t": first_title, "cls": "hot"})
         prose = (
-            "这 %d 段排在「%s」前面，不属于任何一章。打包时它们会并到第一章那一页的"
-            "开头 —— 正文不会丢，但读者翻开第一章，先看到的是一段没头没尾的东西。"
+            "这 %d 段排在「%s」前面，不属于任何一章。打包时它们会收进「前附」卷，"
+            "单独一页 —— 正文不会丢，也不会再挤在第一章开头。"
             % (len(front), first_title)
         )
         return {"lcap": "原文", "rcap": "会怎样", "ro": True, "left": left, "prose": prose}

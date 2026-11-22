@@ -36,7 +36,7 @@ sys.path.insert(0, str(ROOT))
 
 from huoban import epub  # noqa: E402
 from huoban.epub import build_epub, write_epub  # noqa: E402
-from huoban.model import Book, Chapter, Paragraph  # noqa: E402
+from huoban.model import Book, Chapter, Paragraph, from_dict, to_dict  # noqa: E402
 
 NS = {
     "opf": "http://www.idpf.org/2007/opf",
@@ -1692,6 +1692,41 @@ def case_table_renders_as_table() -> None:
     assert any("表格" in w for w in empty_result.warnings), empty_result.warnings
 
 
+def case_explicit_toc_depth() -> None:
+    """嵌套目录结束后允许回到顶层；nav 与 NCX 都保留更深的父子关系。"""
+    raw = to_dict(_book(
+        _chapter("分组甲", level=2),
+        _chapter("甲内章节", ["甲正文。"]),
+        _chapter("独立附录", ["附录正文。"]),
+        _chapter("分组乙", level=2),
+        _chapter("嵌套分组", level=2),
+        _chapter("深层章节", ["深层正文。"]),
+        _chapter("独立尾项", ["尾项正文。"]),
+    ))
+    for chapter, depth in zip(raw["chapters"], [0, 1, 0, 0, 1, 2, 0]):
+        chapter["toc_depth"] = depth
+    result = _build(from_dict(raw))
+    nav = _xml(result, "OEBPS/nav.xhtml")
+    ol = nav.find(".//xhtml:nav/xhtml:ol", NS)
+
+    def nav_tree(container):
+        return [(li.find("xhtml:a", NS).text,
+                 nav_tree(li.find("xhtml:ol", NS)) if li.find("xhtml:ol", NS) is not None else [])
+                for li in container.findall("xhtml:li", NS)]
+
+    def ncx_tree(container):
+        return [(point.find("ncx:navLabel/ncx:text", NS).text, ncx_tree(point))
+                for point in container.findall("ncx:navPoint", NS)]
+
+    expected = [("分组甲", [("甲内章节", [])]), ("独立附录", []),
+                ("分组乙", [("嵌套分组", [("深层章节", [])])]), ("独立尾项", [])]
+    assert nav_tree(ol) == expected, nav_tree(ol)
+    ncx = _xml(result, "OEBPS/toc.ncx")
+    assert ncx_tree(ncx.find("ncx:navMap", NS)) == expected
+    depth = ncx.find("ncx:head/ncx:meta[@name='dtb:depth']", NS)
+    assert depth.get("content") == "3", depth.attrib
+
+
 def main() -> int:
     cases = [
         case_package_structure,
@@ -1700,6 +1735,7 @@ def main() -> int:
         case_nav_not_in_spine,
         case_nav_and_ncx_flat,
         case_toc_nested_with_volume,
+        case_explicit_toc_depth,
         case_chapter_files,
         case_heading_and_note,
         case_verse_paragraph,

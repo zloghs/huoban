@@ -72,21 +72,70 @@ _MAGIC_GIF = b"GIF8"
 # 留下装饰图的代价是一本书里多几张废图，误删插图的代价是内容没了 —— 不对等。
 DECORATIVE_THRESHOLD = 10
 
+# 书前内容的标题关键词（docs/gui-design.md 的「章节切分」一节里的「前附」）。
+# 只在切出第一个正文章节之前生效：之后标题里带「序」也当章节（番外里常有「序」）。
+#
+# 「序」类不靠这张表做主判（见 _is_xu_title）：序章/序曲 与 序言 同一个字开头，
+# `any(word in key)` 分不开。但它仍是**带副标题写法**的唯一判据 ——
+# "译序 致中国读者"去掉空白后以"读者"结尾，首尾两条规则都够不着。
+_FRONT_WORDS = (
+    "版权", "版权页", "扉页", "彩页", "制作说明", "内容简介", "简介", "前言",
+    "序言", "自序", "代序", "译序", "推荐序", "出版说明", "编者的话",
+    "凡例", "编例", "献词", "导读",
+    # 「前附」是本工具自己打出来的书前卷（见 epub.FRONT_MATTER_TITLE）。
+    # 认回前附卷，往返才闭环：不认的话它会被当成普通章，卷内子章的父子关系
+    # 在第二次打包时就丢了。
+    "前附",
+)
+
+# 「序」类标题的**正文**身份：以这些词开头的是正文章节，不是前附。
+# 原来这里是拿长度挡的（`len(key) <= 3`），序曲只有两个字、比"序言"还短，
+# 于是整首序曲被吞进前附、第一章前面多出 29 段（todo/0.3.1.md 记的那次）。
+# 判据只能是"它是不是叙事结构的标记"，字数不是判据。
+_BODY_XU_WORDS = (
+    # 叙事结构（戏剧/音乐式的分段）
+    "序章", "序篇", "序卷", "序部", "序幕", "序曲", "序诗", "序歌",
+    "序场", "序回", "序奏", "序乐", "序集",
+    # 编号/对局/军事类章节名（科幻、游戏、战争题材常见）
+    "序列", "序号", "序数", "序盘", "序战",
+    # 学术书的"序论/序说"是正文第一个论证单元（导论），不是序跋
+    "序论", "序说",
+)
+
+# 「X序」形态的**前附**：序本身，序一/序二，自序/代序/译序/总序/小序，
+# 推荐序/主编序/丛书序，第二版序/修订版序。
+# 只认这些修饰语，**不认"短标题以序结尾"**：秩序、失序、乱序、时序、程序
+# 都是两字的正文章节名，一刀切会把它们整批吞进前附。
+# 代价是"王蒙序"这类"人名+序"会漏判成正文章节 —— 漏判只是书首多一个短章，
+# 误判是正文段落跑进前附、章边界消失，两边代价不对等，宁可漏。
+_XU_TAIL = re.compile(
+    r"^(?:"
+    r"[自代译原总小]|编者|作者|著者|译者|校注者|主编|出版者|推荐|丛书|文库|全集|文集"
+    r"|新|再版|初版|新版|增订版?|修订版?|校订版?|重订版?|补订版?"
+    r"|第[一二三四五六七八九十百零〇0-9]{1,3}(?:版|次印刷|次印|刷)"
+    r"|(?:19|20)[0-9]{2}年(?:版)?"
+    r")?[序叙]$"
+)
+
+# 「序」类标题只判主干：冒号/破折号/间隔号/括号之后是副标题，不参与判定。
+# 真实目录里有"自序：我为什么写这本书""序——致读者""序（某某作）"。
+_XU_SUBTITLE = re.compile(r"[：:、·・—–―\-－，,（(]")
+
+# 包在标题最外层的括号（目录里"（序）""【自序】""「序」"这种写法）：括号本身
+# 不是内容，判之前先脱掉 —— 不脱的话"（序）"既不以"序"开头也不以"序"结尾，
+# 两条规则都够不着，会掉进正文变成一个章。
+_XU_WRAP = "（）()【】〔〕[]「」『』《》〈〉"
+
+# 前附卷在目录里的标题。必须与 epub.FRONT_MATTER_TITLE 一致；不能从 epub 导入
+# （epub 反过来依赖 model/epubread 的数据结构，会成环）。导入自家产物时靠这个
+# 名字认出已经成卷的前附，避免再套一层「前附」。
+_FRONT_VOLUME_TITLE = "前附"
+
 # 掌阅注标（`<img class="zhangyue-footnote" zy-footnote="注文">`）：整只标签抓下来
 # 再单独取 src —— 属性顺序不受我们控制，正则不能依赖固定顺序，否则换序后会静默失效。
 _ZY_NOTE_IMG_RE = re.compile(r"""<img\b[^>]*\bzy-footnote\s*=[^>]*>""", re.I)
 _IMG_SRC_RE = re.compile(r"""\bsrc\s*=\s*["']([^"']+)["']""", re.I)
 
-# 前言区的标题关键词（docs/gui-design.md 的「章节切分」一节里的「前附」）。只在前缀位置生效：一旦切出了第一
-# 个正文章节，后面再出现"序"字样的标题就一律当章节（番外里常有"序"）。
-_FRONT_WORDS = (
-    "版权", "扉页", "制作说明", "内容简介", "简介", "前言",
-    "序言", "自序", "代序", "译序", "出版说明", "编者的话",
-    # 「前附」是 0.4.0 起本工具自己打出来的书前封面页（见 epub.FRONT_MATTER_TITLE）。
-    # 认回前言，往返才闭环：不认的话它会被当成一个普通章（level=1），
-    # 再打一次包时 front_matter 已空、前附卷不再合成 —— 同一本书转两遍结构就变了。
-    "前附",
-)
 # 目录页：整页都是链接，重排后没有意义，直接丢弃（不占章节、不进前言）。
 _TOC_WORDS = ("目录", "目次", "contents", "tableofcontents")
 
@@ -144,6 +193,7 @@ class _NavNode:
     fragment: str = ""  # #anchor 部分（文档内切分用）
     children: list["_NavNode"] = field(default_factory=list)
     order: int = 0      # 先序遍历序号（位置回退时保持目录顺序）
+    depth: int = 0      # 原目录深度，与标题采用的卷章排版分开保存
 
 
 @dataclass
@@ -642,14 +692,15 @@ def _parse_nav(zf: zipfile.ZipFile, name: str, base: str, resolve, warnings: lis
 
 
 def _flatten(nodes: list[_NavNode]) -> list[_NavNode]:
-    """先序遍历，顺便打上连续序号（位置回退与"未消费节点"统计都靠它）。"""
+    """先序遍历，保留原目录深度并打上连续序号（位置回退与未消费统计用）。"""
     out: list[_NavNode] = []
 
-    def walk(items: list[_NavNode]) -> None:
+    def walk(items: list[_NavNode], depth: int = 0) -> None:
         for node in items:
             node.order = len(out) + 1
+            node.depth = depth
             out.append(node)
-            walk(node.children)
+            walk(node.children, depth + 1)
 
     walk(nodes)
     return out
@@ -1524,9 +1575,9 @@ def _drop_unreferenced_anchors(book) -> int:
     return dropped
 
 
-# 章末注释区的小标题（「注释：」「注　释」）不是内容。注文被注码指到、变成 note
-# （掌阅弹注）之后，这个小标题没有任何注码指向，会以普通正文段留在章末 ——
-# 实测《鱼不存在》10 章各留一行孤零零的「注释：」。
+# 章末注释区的小标题（「注释：」「注　释」「Annotations」）不是内容。注文被注码
+# 指到、变成 note（掌阅弹注）之后，这个小标题没有任何注码指向，会以普通正文段
+# 留在章末 —— 实测《鱼不存在》10 章各留一行孤零零的「注释：」。
 #
 # 判据是"整串相等"而不是"含注释二字"：正文里以注释开头的句子（"注释是理解
 # 的桥梁"）不能碰。写法枚举覆盖简繁与常见的「编者注/校注/尾注」。
@@ -1722,17 +1773,39 @@ def _stem_title(title: str) -> str:
     return out
 
 
+def _is_xu_title(title: str) -> bool | None:
+    """「序」类标题是哪一种：True=前附（序跋），False=正文（序章/序曲），None=跟序无关。
+
+    三条判据按顺序来，"正文"必须压在"序字头"之前：否则 序章/序曲 全会被
+    第一个字带进前附。只看主干（副标题切掉、外层括号脱掉），因为
+    "自序：我为什么写这本书"的重心在前两个字上。
+    """
+    key = _norm_key(title).strip(_XU_WRAP)
+    if not key:
+        return None
+    stem = _XU_SUBTITLE.split(key, 1)[0] or key
+    if stem.startswith(_BODY_XU_WORDS):
+        return False
+    if stem.startswith("序"):
+        return True
+    if _XU_TAIL.match(stem):
+        return True
+    return None
+
+
 def _is_front_title(title: str) -> bool:
-    """这个目录标题像不像"前附"（版权页/扉页/序/译序/制作说明…）。"""
+    """这个目录标题算不算书前内容（版权页/扉页/序跋/制作说明…）。
+
+    先判「序」类 —— 它有明确的正反两族；判不出结论才落到关键词表。关键词按
+    「包含」匹配，所以「版权」能一并盖住「版权页」「版权信息」这些写法。
+    """
+    xu = _is_xu_title(title)
+    if xu is not None:
+        return xu
     key = _norm_key(title).lower()
     if not key:
         return False
-    if any(word in key for word in _FRONT_WORDS):
-        return True
-    # 单独的"序"/"序一"/"序二"：只认极短且不是"序章/序幕"（那是正文）。
-    if key.startswith("序") and len(key) <= 3 and not key.startswith(("序章", "序幕")):
-        return True
-    return False
+    return any(word in key for word in _FRONT_WORDS)
 
 
 def _is_toc_title(title: str) -> bool:
@@ -1765,8 +1838,9 @@ def _is_cover_page(title: str) -> bool:
 def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list[int]:
     """算出每个目录节点在 items 里的起始下标（单调不减）。
 
-    正常情况靠 #anchor 定位；锚点丢了（破损/改名）就在相邻已知锚点之间
-    均分 —— 宁可切得粗糙，也不能让第一个节点吞掉整篇、其余全是空章。
+    优先靠 #anchor 定位；缺少或找不到锚点时，在相邻已知位置之间找唯一的
+    同名标题块。找不到或有歧义才均分，避免把标题和开头正文切到前一项；
+    均分虽然粗糙，仍能避免首个节点吞掉整篇、后续节点为空。
     `key` 与解析时用的是同一份：items 里的锚点已带文件命名空间，目录片段
     也要换成同一种键才比得上。
     """
@@ -1787,6 +1861,18 @@ def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list
         if want and want in anchor_at and anchor_at[want] >= prev:
             pos[i] = anchor_at[want]
             prev = pos[i]
+    headings: dict[str, list[int]] = {}
+    for idx, item in enumerate(items):
+        if item[0] == "text" and item[2] == "heading":
+            headings.setdefault(_norm_key(item[1]), []).append(idx)
+    for i, node in enumerate(nodes):
+        if pos[i] is not None:
+            continue
+        start = next((p for p in reversed(pos[:i]) if p is not None), 0)
+        end = next((p for p in pos[i + 1:] if p is not None), len(items))
+        matches = [p for p in headings.get(_norm_key(node.title), []) if start <= p < end]
+        if len(matches) == 1:
+            pos[i] = matches[0]
     i = 0
     while i < len(nodes):
         if pos[i] is not None:
@@ -1813,40 +1899,6 @@ def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list
     return [int(p or 0) for p in pos]
 
 
-def _carry_refs(items: list[list], refs: list) -> list[list]:
-    """把被删标题块上的注码挪到后面第一块正文的开头。
-
-    这是**没有章节实体可挂时**的退化路径 —— 现在只剩前言会走到这里（前言不是
-    Chapter，存不下标题注；见 `Chapter.refs`）。正文里的章节由 `_new_chapter`
-    把注码挂到 `Chapter.refs`，位置不受影响。
-
-    为什么必须挪：章首标题与目录标题重复时整块会被剔掉，而掌阅注标是写在
-    标题里的（`<h1>第一章<img class="zhangyue-footnote" …></h1>`）。块一删，
-    注码跟着消失；随后 `_finalize_refs` 判定"没有任何引用指向这条注文"，
-    把注文也丢掉 —— 成品里注码和注文两样都不剩，读者完全看不出少了东西。
-    真样本《嘯風山莊》里就有三条注释是这么没的。
-
-    位置代价：注码本来在标题末尾，挪过去之后落在第一句之前，差几个字。
-    前言没有后续正文块时，退化成只带注码的空壳段落，
-    渲染层会把只带注码的空段照样输出。
-    """
-    if not refs:
-        return items
-    out = list(items)
-    for idx, item in enumerate(out):
-        if item[0] != "text" or item[2] in ("blank", "note"):
-            continue
-        old = item[3] if len(item) > 3 else []
-        # 多条注码不能全给 0：_inline_html 按 at 排序后遇到 at < pos 会跳过，
-        # 同一位置只插得进第一条。给 0,1,2… 让它们依次落在段首几个字之间。
-        limit = len(item[1])
-        moved = [{**r, "at": min(i, limit)} for i, r in enumerate(refs)]
-        out[idx] = [item[0], item[1], item[2], moved + list(old)]
-        return out
-    out.append(["text", "", "body", [{**r, "at": 0} for r in refs]])
-    return out
-
-
 def _drop_duplicate_heading(items: list[list], title: str) -> tuple[list[list], list]:
     """去掉章节开头那个"和目录标题重复"的标题块，返回 (剩下的块, 被删块的注码)。
 
@@ -1861,8 +1913,11 @@ def _drop_duplicate_heading(items: list[list], title: str) -> tuple[list[list], 
        一段正文"。这条要求**完全相等且只看开头**，所以吃不掉正常句子。
     2. 前 3 个标题块里允许互相包含（`第一章` 与 `第一章　劫后梦醒` 是同一章）。
 
-    注码不跟着标题一起消失：被删块上的 refs 单独交回调用方 —— 正文章节把它存进
-    `Chapter.refs`（打包时写回标题），前言只能交给 `_carry_refs` 挪进正文。
+    注码不跟着标题一起消失：被删块上的 refs 单独交回调用方，由 `_new_chapter`
+    存进 `Chapter.refs`，打包时写回标题末尾。列入 NCX/nav 的前附也有自己的
+    Chapter，不再走无名前言的退化路径。若注码随标题删除，`_finalize_refs`
+    会因没有引用而继续删除注文，成品会无提示地同时丢失注码和注文；
+    真样本《嘯風山莊》曾因此丢失三条注释。
     """
     key = _norm_key(title)
     if not key:
@@ -1895,7 +1950,7 @@ def _merge_pieces(chapters: list[Chapter]) -> tuple[list[Chapter], int, int]:
     """相邻同主干的分片合并（docs/gui-design.md 的「章节切分」一节），返回 (合并后的章节, 组合数, 合并前片数)。
 
     为什么要求"相邻"：不相邻的同名章（"第一章"出现在两卷里）合并会把
-    两段隔了几百章的内容缝到一起。相邻 + 同主干 + 同层级（都是章）才合。
+    两段隔了几百章的内容缝到一起。相邻、同主干、都是章且目录深度相同才合。
     """
     pieces = sum(1 for ch in chapters if ch.level == 1)
     merged: list[Chapter] = []
@@ -1907,6 +1962,7 @@ def _merge_pieces(chapters: list[Chapter]) -> tuple[list[Chapter], int, int]:
             merged
             and ch.level == 1
             and merged[-1].level == 1
+            and ch.toc_depth == merged[-1].toc_depth
             and stem
             and stem == _stem_title(merged[-1].title)
         ):
@@ -2194,8 +2250,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     name_map: dict[str, str] = {}   # zip 内图片名 → 落盘文件名
     size_cache: dict[str, tuple[int, int]] = {}
     current: list[Paragraph] = front   # 当前"续写目标"（前言或某章的段落表）
-    chapters_started = False
-    front_entries = 0      # 被归进前言的目录条目数（版权/序/制作说明…）
+    front_volume: Chapter | None = None  # 已建的「前附（卷）」；原目录前附条目收在它下面
+    chapters_started = False             # 是否已切出第一个正文条目
+    front_entries = 0                    # 前附卷下的子章数（报告用）
     toc_dropped = 0        # 被当成目录页丢掉的条目数
     cover_pages_dropped = 0 # 被当成重复封面页丢掉的条目数（与目录页同一条路）
     continuation_docs = 0  # 目录里没有、续接到当前章节的文档数
@@ -2320,9 +2377,11 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         if target:
             _store_back_image(target)
 
-    def _new_chapter(title: str, level: int, items: list[list]) -> Chapter:
+    def _new_chapter(
+        title: str, level: int, items: list[list], toc_depth: int | None = None
+    ) -> Chapter:
         nonlocal current
-        ch = Chapter(title=title, level=level, start_line=0)
+        ch = Chapter(title=title, level=level, start_line=0, toc_depth=toc_depth)
         heading = parse_heading(title)
         ch.number = heading.number if heading is not None else None
         chapters.append(ch)
@@ -2331,6 +2390,52 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         rest, title_refs = _drop_duplicate_heading(items, title)
         ch.refs = fit_refs(title_refs, title)
         _emit(rest)
+        return ch
+
+    def _start_front_volume(title: str, items: list[list], toc_depth: int | None) -> Chapter:
+        """建立「前附（卷）」，把此前积在前言里的零散段落收进卷首页。
+
+        两个入口共用：原书目录里本来就写着「前附」这一卷（直接接管，不再套第二层），
+        或者先遇到前附条目、卷还没建（由 _ensure_front_volume 触发）。
+        """
+        nonlocal current, front_volume
+        ch = Chapter(title=title, number=None, level=2, start_line=0, toc_depth=toc_depth)
+        if front:
+            ch.paragraphs.extend(front)
+            front.clear()
+        chapters.append(ch)
+        front_volume = ch
+        current = ch.paragraphs
+        rest, title_refs = _drop_duplicate_heading(items, title)
+        ch.refs = fit_refs(title_refs, title)
+        _emit(rest)
+        return ch
+
+    def _ensure_front_volume() -> Chapter:
+        """前附卷按需创建：只有真遇到前附条目才多出这一卷，没有前附的书结构不变。"""
+        if front_volume is None:
+            _start_front_volume(_FRONT_VOLUME_TITLE, [], 0)
+        return front_volume
+
+    def _new_front_chapter(title: str, items: list[list]) -> Chapter:
+        """把原目录里的一个前附条目收成前附卷的子章。
+
+        标题必须留下（目录里要显示原名），正文里与它重复的那块标题仍然剔除，
+        否则同一个名字会印两遍。目录深度取卷的深度加一：卷本身就是原书给的时，
+        子章得跟着它所在的层级走，不能一律写死成 1。
+        """
+        nonlocal current, front_entries
+        volume = _ensure_front_volume()
+        depth = volume.toc_depth + 1 if isinstance(volume.toc_depth, int) else 1
+        ch = Chapter(title=title, level=1, start_line=0, toc_depth=depth)
+        heading = parse_heading(title)
+        ch.number = heading.number if heading is not None else None
+        chapters.append(ch)
+        current = ch.paragraphs
+        rest, title_refs = _drop_duplicate_heading(items, title)
+        ch.refs = fit_refs(title_refs, title)
+        _emit(rest)
+        front_entries += 1
         return ch
 
     if not nav_nodes:
@@ -2362,7 +2467,6 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 # 第一页之前若有零散文字（版权/扉页），先留在前言里
                 pass
             _new_chapter(title, 1, items)
-            chapters_started = True
     else:
         leftover: set[int] = set(node.order for node in flat)
         for name in spine_docs:
@@ -2400,18 +2504,19 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 if _is_cover_page(title):
                     cover_pages_dropped += 1
                     continue  # 封面/书名页：与目录页同一条路，整页丢弃
-                if not chapters_started and _is_front_title(title):
-                    # 前缀位置的"序/版权/制作说明"归前言：不建章节。
-                    # 前言不是 Chapter，存不下标题注，注码只能挪进正文。
-                    front_entries += 1
-                    current = front
-                    rest, refs = _drop_duplicate_heading(seg, title)
-                    _emit(_carry_refs(rest, refs))
-                    continue
                 if not title:
                     title = posixpath.splitext(posixpath.basename(name))[0]
+                if not chapters_started:
+                    # 书前内容只在切出第一章之前成立。自家产物里已经有「前附」卷时
+                    # 直接接管它（不再套第二层），其余前附条目收成这一卷的子章。
+                    if _norm_key(title) == _FRONT_VOLUME_TITLE:
+                        _start_front_volume(title, seg, node.depth)
+                        continue
+                    if _is_front_title(title):
+                        _new_front_chapter(title, seg)
+                        continue
                 level = 2 if node.children else 1
-                _new_chapter(title, level, seg)
+                _new_chapter(title, level, seg, toc_depth=node.depth)
                 chapters_started = True
         if leftover:
             warnings.append(f"目录里有 {len(leftover)} 个条目指向的文档不在 spine 里，已跳过")

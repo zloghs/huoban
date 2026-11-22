@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import tempfile
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -35,6 +37,7 @@ from huoban.cli import main as cli_main  # noqa: E402
 from huoban.epub import _image_ratio_class, build_epub  # noqa: E402
 from huoban.epubread import (  # noqa: E402
     EpubReadError,
+    _is_front_title,
     _image_size,
     read_epub,
     read_epub_with_report,
@@ -157,7 +160,7 @@ def _kinds(chapter: Chapter) -> list[str]:
 
 
 def case_epub2_basic_split() -> None:
-    """EPUB2 + NCX：卷/章两级、前言归前附、章首重复标题被剔除、各段落类型到位。"""
+    """EPUB2 + NCX：前附与卷章各守目录边界、重复标题剔除、各段落类型到位。"""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         opf = _opf(
@@ -201,22 +204,23 @@ def case_epub2_basic_split() -> None:
         }
         book = read_epub(_epub(tmp, entries))
 
-        # 前言：版权页归 front_matter，不建章节
-        assert len(book.front_matter) == 1, [p.text for p in book.front_matter]
-        assert book.front_matter[0].kind == "body"
+        # 版权页是前附卷下的子章，标题与正文都在
+        assert book.front_matter == [], [p.text for p in book.front_matter]
+        assert [ch.title for ch in book.chapters] == [
+            "前附", "版权页", "第一卷 风起", "第一章 开端"
+        ], [ch.title for ch in book.chapters]
+        assert [ch.level for ch in book.chapters] == [2, 1, 2, 1]
+        assert [ch.toc_depth for ch in book.chapters] == [0, 1, 0, 1]
+        assert [p.text for p in book.chapters[1].paragraphs] == ["版权信息一段。"]
 
-        # 章节：1 卷 + 1 章（章标题取自目录，正文里重复的 h2 被剔除）
-        assert [ch.title for ch in book.chapters] == ["第一卷 风起", "第一章 开端"], [
-            ch.title for ch in book.chapters
-        ]
-        assert [ch.level for ch in book.chapters] == [2, 1]
-        ch = book.chapters[1]
+        # 章节：前附卷 + 前附子章 + 1 卷 + 1 章（章标题取自目录，正文里重复的 h2 被剔除）
+        ch = book.chapters[3]
         assert ch.number == 1, ch.number
         assert _kinds(ch) == ["body", "blank", "body", "sep", "heading", "verse", "note"], _kinds(ch)
         assert ch.paragraphs[-1].text == "注释文字。", ch.paragraphs[-1].text
 
         # 卷标题页：重复的 h1 被剔除后没有正文（level=2 允许空）
-        assert book.chapters[0].paragraphs == []
+        assert book.chapters[2].paragraphs == []
 
 
 def case_leading_body_title_echo_is_dropped() -> None:
@@ -414,6 +418,91 @@ def case_unanchored_first_node_owns_doc_head() -> None:
         assert texts[1] == ["第二章的正文。"], texts[1]
         assert texts[2] == ["第三章的正文。"], texts[2]
         assert book.front_matter == [], [p.text for p in book.front_matter]
+
+
+def case_missing_anchor_matches_unique_heading() -> None:
+    """共享文档缺失锚点时，标题和开头正文不能被均分到前一项。"""
+    for fragment in ("", "#missing"):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            second = [f"乙正文{i}。" for i in range(10)]
+            entries = {
+                "OEBPS/content.opf": _opf(spine=["all"], manifest=[
+                    ("all", "Text/all.xhtml", "application/xhtml+xml", ""),
+                    ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                ]),
+                "OEBPS/toc.ncx": _ncx(
+                    _navpoint("章节甲", "Text/all.xhtml#a")
+                    + _navpoint("章节乙", "Text/all.xhtml" + fragment)
+                    + _navpoint("章节丙", "Text/all.xhtml#c")
+                ),
+                "OEBPS/Text/all.xhtml": XHTML.format(body=(
+                    '<h1 id="a">章节甲</h1><p>甲正文。</p><h2>章节乙</h2>'
+                    + "".join(f"<p>{text}</p>" for text in second)
+                    + '<h2 id="c">章节丙</h2><p>丙正文。</p>'
+                )),
+            }
+            book = read_epub(_epub(tmp, entries))
+            assert [p.text for p in book.chapters[0].paragraphs] == ["甲正文。"]
+            assert [p.text for p in book.chapters[1].paragraphs] == second
+            assert [p.text for p in book.chapters[2].paragraphs] == ["丙正文。"]
+
+
+def case_toc_depth_survives_import_and_roundtrip() -> None:
+    """原目录深度要过 JSON 与 EPUB 回环，同名顶层条目不能并入前一分组。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        titles = ["分组甲", "附录", "附录", "分组乙", "嵌套分组", "深层章节"]
+        points = (
+            _navpoint(titles[0], "Text/d0.xhtml", _navpoint(titles[1], "Text/d1.xhtml"))
+            + _navpoint(titles[2], "Text/d2.xhtml")
+            + _navpoint(titles[3], "Text/d3.xhtml",
+                        _navpoint(titles[4], "Text/d4.xhtml", _navpoint(titles[5], "Text/d5.xhtml")))
+        )
+        entries = {
+            "OEBPS/content.opf": _opf(spine=[f"d{i}" for i in range(len(titles))], manifest=[
+                (f"d{i}", f"Text/d{i}.xhtml", "application/xhtml+xml", "") for i in range(len(titles))
+            ] + [("ncx", "toc.ncx", "application/x-dtbncx+xml", "")]),
+            "OEBPS/toc.ncx": _ncx(points),
+            **{f"OEBPS/Text/d{i}.xhtml": XHTML.format(body=f"<h1>{title}</h1><p>正文{i}。</p>")
+               for i, title in enumerate(titles)},
+        }
+        book = read_epub(_epub(tmp, entries))
+        assert [c.title for c in book.chapters] == titles
+        assert [getattr(c, "toc_depth", None) for c in book.chapters] == [0, 1, 0, 0, 1, 2]
+        book = from_dict(json.loads(json.dumps(to_dict(book))))
+        rebuilt = build_epub(book, modified=FIXED_MODIFIED)
+        rebuilt_path = tmp / "rebuilt.epub"
+        rebuilt_path.write_bytes(rebuilt.data)
+        back = read_epub(rebuilt_path)
+        assert [c.title for c in back.chapters] == titles
+        assert [c.toc_depth for c in back.chapters] == [0, 1, 0, 0, 1, 2]
+        assert [[p.text for p in c.paragraphs] for c in back.chapters] == [
+            [f"正文{i}。"] for i in range(len(titles))
+        ]
+        # EPUB3 只有 nav、没有 NCX 时，也必须得到同样的深度和分组边界。
+        nav_entries = dict(entries)
+        del nav_entries["OEBPS/toc.ncx"]
+        nav_entries["OEBPS/content.opf"] = _opf(
+            spine=[f"d{i}" for i in range(len(titles))],
+            manifest=[(f"d{i}", f"Text/d{i}.xhtml", "application/xhtml+xml", "")
+                      for i in range(len(titles))]
+            + [("nav", "nav.xhtml", "application/xhtml+xml", "nav")],
+        )
+        nav_entries["OEBPS/nav.xhtml"] = XHTML.format(body=(
+            '<nav epub:type="toc"><ol>'
+            '<li><a href="Text/d0.xhtml">分组甲</a><ol>'
+            '<li><a href="Text/d1.xhtml">附录</a></li></ol></li>'
+            '<li><a href="Text/d2.xhtml">附录</a></li>'
+            '<li><a href="Text/d3.xhtml">分组乙</a><ol>'
+            '<li><a href="Text/d4.xhtml">嵌套分组</a><ol>'
+            '<li><a href="Text/d5.xhtml">深层章节</a></li>'
+            '</ol></li></ol></li></ol></nav>'
+        ))
+        nav_book = read_epub(_epub(tmp, nav_entries, name="nav-only.epub"))
+        assert [(c.title, c.toc_depth) for c in nav_book.chapters] == [
+            (c.title, c.toc_depth) for c in book.chapters
+        ]
 
 
 def case_piece_merge() -> None:
@@ -998,10 +1087,11 @@ def case_roundtrip_with_images() -> None:
         epub_path.write_bytes(built.data)
 
         back = read_epub(epub_path, image_dir=tmp / "out")
-        assert [ch.title for ch in back.chapters] == ["第一章 开端", "第二章 继续"], [
+        assert [ch.title for ch in back.chapters] == ["前附", "第一章 开端", "第二章 继续"], [
             ch.title for ch in back.chapters
         ]
-        paras = back.chapters[0].paragraphs
+        assert [p.text for p in back.chapters[0].paragraphs] == ["前言一段。"]
+        paras = back.chapters[1].paragraphs
         imgs = [p for p in paras if p.kind == "image"]
         assert len(imgs) == 2, len(imgs)
         assert (imgs[0].width, imgs[0].height) == (600, 1200), (imgs[0].width, imgs[0].height)
@@ -1066,8 +1156,8 @@ def case_self_roundtrip_kinds() -> None:
 
     允许的结构性差异（不是 kind 退化）：
     - 空行：渲染时折叠/掐尾，重排回来数量会变，故比较时剔除 blank；
-    - 前言后记：契约里没有独立文件位，打包时折进第一个叶子章/最后一章，
-      重排回来就落在那两章里（顺序与 kind 不变）；
+    - 书前内容：打包时收成「前附」卷，重排回来是卷首页加原章节（顺序与 kind 不变）；
+    - 后记：仍折进最后一章末尾，重排回来就在那一章里；
     - 图片文件名：落盘名由导入器重新编号（imgNNN.ext），身份以尺寸+图说+顺序为准。
     """
     with tempfile.TemporaryDirectory() as td:
@@ -1129,13 +1219,13 @@ def case_self_roundtrip_kinds() -> None:
         imp = read_epub_with_report(epub_path, image_dir=tmp / "out")
         back = imp.book
 
-        # 1) 章数、标题、卷级不变
-        assert [c.title for c in back.chapters] == [c.title for c in book.chapters], [
-            c.title for c in back.chapters
-        ]
-        assert [c.level for c in back.chapters] == [c.level for c in book.chapters], [
-            c.level for c in back.chapters
-        ]
+        # 1) 书前内容回环成「前附」卷，原章节标题与卷级不变
+        assert [c.title for c in back.chapters] == [
+            "前附", *[c.title for c in book.chapters]
+        ], [c.title for c in back.chapters]
+        assert [c.level for c in back.chapters] == [
+            2, *[c.level for c in book.chapters]
+        ], [c.level for c in back.chapters]
 
         # 2) kind 序列一字不差（这是本用例的核心断言）
         assert _flatten_kinds(back) == _flatten_kinds(book), (
@@ -1595,29 +1685,40 @@ def case_note_heading_dropped() -> None:
         ], [p.text for p in second.paragraphs]
 
 
-def case_cover_page_dropped_like_toc() -> None:
-    """封面重复页跟目录页走同一条路：整页丢弃，不占章节、也不进书前内容。
+def case_front_xu_titles() -> None:
+    """「序」有两副面孔：序跋归前附，序章/序曲/序篇是正文章节。
 
-    三类页都在这里：《谁的问题》的「书名页」—— 封面与版权页已经写着书名与
-    作者，再排一页只有这两行；《象首迷宫》目录里的「书封」—— 整页只有一张
-    封面图，而封面图由打包器重做；导航里直接叫「封面」的页面 —— 同一件事的
-    最常见写法。判据与目录页同一口径：去掉空白后含关键词，「书名页」
-    「书名：…」「书封」「封面」都算。
+    回归（todo/0.3.1.md 记的那次）：旧判据是"序开头且不超过 3 个字"——
+    序曲只有两个字、比"序言"还短，整首序曲被吞进前附，第一章前面多出 29 段。
+    长度不是判据，是不是叙事结构的标记才是。
 
-    作者名不许跟着这一页一起丢：它来自 OPF 的 dc:creator，不是正文。
+    反方向同样要钉住：为了救序曲，不能把所有"结尾是序"的短标题都当前附 ——
+    秩序、失序 是两字的**正文章节名**。
     """
-    docs = [
-        ("书封", "cover"),
-        ("封面", "cv"),
-        ("书名页", "name"),
-        ("版权信息", "copy"),
-        ("第一章 开端", "ch1"),
-    ]
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        entries = {
+        # 前附：序跋一类的写法（带副标题的、带版次的、单字的）
+        front = [
+            ("版权信息", "front"),
+            ("推荐序：写在前面", "rec"),
+            ("译序 致中国读者", "trans"),
+            ("第二版序", "v2"),
+            ("序", "xu"),
+            # 包在括号里的写法：括号不是内容，判之前要脱掉
+            ("（序）", "xu_paren"),
+        ]
+        # 正文：结构词开头，全是章
+        body = [
+            ("序曲", "overture"),
+            ("序篇", "prelude"),
+            ("序章 雪夜", "pro"),
+            ("（序章）", "pro_paren"),
+            ("第一章 开端", "ch1"),
+        ]
+        docs = front + body
+        entries: dict[str, str] = {
             "OEBPS/content.opf": _opf(
-                spine=[k for _, k in docs],
+                spine=[k for _, k in docs] + ["ncx"],
                 manifest=[
                     (k, f"Text/{k}.xhtml", "application/xhtml+xml", "") for _, k in docs
                 ]
@@ -1626,41 +1727,47 @@ def case_cover_page_dropped_like_toc() -> None:
             "OEBPS/toc.ncx": _ncx(
                 "".join(_navpoint(t, f"Text/{k}.xhtml") for t, k in docs)
             ),
-            "OEBPS/Text/cover.xhtml": XHTML.format(
-                body="<h1>书封</h1><p>封面式样</p>"
-            ),
-            "OEBPS/Text/cv.xhtml": XHTML.format(
-                body="<h1>封面</h1><p>一张图占满整页</p>"
-            ),
-            "OEBPS/Text/name.xhtml": XHTML.format(
-                body="<h1>书名页</h1><p>测试书</p><p>某作者</p>"
-            ),
-            "OEBPS/Text/copy.xhtml": XHTML.format(
-                body="<h1>版权信息</h1><p>书名：测试书</p><p>出版社：某社</p>"
-            ),
-            "OEBPS/Text/ch1.xhtml": XHTML.format(
-                body="<h1>第一章 开端</h1><p>正文第一段。</p>"
-            ),
         }
+        for title, key in docs:
+            entries[f"OEBPS/Text/{key}.xhtml"] = XHTML.format(
+                body=f"<h2>{title}</h2><p>{title}一段。</p>"
+            )
         imp = read_epub_with_report(_epub(tmp, entries))
 
-    book = imp.book
-    assert [ch.title for ch in book.chapters] == ["第一章 开端"], [
-        ch.title for ch in book.chapters
-    ]
-    # 三页都整页不在了：标题与页里那几段一个都不许漏进别的段
-    texts = [p.text for p in _all_paragraphs(book)]
-    assert "书封" not in texts, texts
-    assert "封面式样" not in texts, texts
-    assert "封面" not in texts, texts
-    assert "一张图占满整页" not in texts, texts
-    assert "书名页" not in texts, texts
-    assert "测试书" not in texts, texts
-    assert "某作者" not in texts, texts
-    # 版权页自己的「书名：…」是版权信息的一部分，照旧保留
-    assert "书名：测试书" in texts, texts
-    assert imp.report["cover_pages_dropped"] == 3, imp.report
-    assert book.author == "某作者", book.author
+        front_titles = [t for t, _ in front]
+        body_titles = [t for t, _ in body]
+        # 前附卷在前，序跋作为它的子章；结构词标题在卷外，仍是正文
+        assert [ch.title for ch in imp.book.chapters] == [
+            "前附", *front_titles, *body_titles
+        ], [ch.title for ch in imp.book.chapters]
+        assert imp.book.front_matter == [], [p.text for p in imp.book.front_matter]
+        assert imp.report["front_matter_entries"] == len(front_titles), imp.report["front_matter_entries"]
+        for i, title in enumerate(front_titles, start=1):
+            assert [p.text for p in imp.book.chapters[i].paragraphs] == [f"{title}一段。"]
+
+    # 反方向：「秩序」是正文，不能因为"结尾是序"就当前附
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        entries = {
+            "OEBPS/content.opf": _opf(
+                spine=["z", "c1", "ncx"],
+                manifest=[
+                    ("z", "Text/z.xhtml", "application/xhtml+xml", ""),
+                    ("c1", "Text/c1.xhtml", "application/xhtml+xml", ""),
+                    ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                ],
+            ),
+            "OEBPS/toc.ncx": _ncx(
+                _navpoint("秩序", "Text/z.xhtml") + _navpoint("第一章", "Text/c1.xhtml")
+            ),
+            "OEBPS/Text/z.xhtml": XHTML.format(body="<h2>秩序</h2><p>失序的一段。</p>"),
+            "OEBPS/Text/c1.xhtml": XHTML.format(body="<h2>第一章</h2><p>正文。</p>"),
+        }
+        book = read_epub(_epub(tmp, entries))
+        assert [ch.title for ch in book.chapters] == ["秩序", "第一章"], [
+            ch.title for ch in book.chapters
+        ]
+        assert book.front_matter == [], [p.text for p in book.front_matter]
 
 
 def case_generated_info_page_skipped() -> None:
@@ -1694,7 +1801,8 @@ def case_generated_info_page_skipped() -> None:
         )
         entries["OEBPS/content.opf"] = opf
         entries["OEBPS/toc.ncx"] = _ncx(
-            [("第1章 假", "Text/c1.xhtml"), ("第2章 假", "Text/c2.xhtml")]
+            _navpoint("第1章 假", "Text/c1.xhtml")
+            + _navpoint("第2章 假", "Text/c2.xhtml")
         )
         imp = read_epub_with_report(_epub(tmp, entries))
 
@@ -1742,7 +1850,8 @@ def case_back_cover_page_skipped() -> None:
         )
         entries["OEBPS/content.opf"] = opf
         entries["OEBPS/toc.ncx"] = _ncx(
-            [("第1章 假", "Text/c1.xhtml"), ("第2章 假", "Text/c2.xhtml")]
+            _navpoint("第1章 假", "Text/c1.xhtml")
+            + _navpoint("第2章 假", "Text/c2.xhtml")
         )
         imp = read_epub_with_report(_epub(tmp, entries), image_dir=tmp / "out")
 
@@ -2557,14 +2666,175 @@ def case_zhangyue_mark_is_not_a_picture() -> None:
     assert len(refs) == 12, refs
 
 
+def case_front_entries_keep_titles_and_chapter_boundaries() -> None:
+    """原目录里的前附各有标题与边界，不能揉成第一章标题之前的无名段落。
+
+    真实样本里「序曲」被「序」的前附规则误吞，和版权信息一起进了第一章；
+    前附标题又被重复标题清洗删掉。目录既然已经给出每个条目的名字与落点，
+    就不该再用关键词抹掉这层结构。
+
+    封面页与书名页不在这张表里：它们整页丢弃，与目录页同一条路（见
+    case_cover_page_dropped_like_toc）。
+    """
+    titles = [
+        "版权信息", "内容简介", "简介", "前言", "序言", "自序", "代序", "译序",
+        "彩页", "序曲", "第一章 开端",
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        ids = [f"c{i}" for i in range(len(titles))]
+        entries = {
+            "OEBPS/content.opf": _opf(
+                spine=ids,
+                manifest=[
+                    *[
+                        (iid, f"Text/part{i}.xhtml", "application/xhtml+xml", "")
+                        for i, iid in enumerate(ids)
+                    ],
+                    ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                ],
+            ),
+            "OEBPS/toc.ncx": _ncx("".join(
+                _navpoint(title, f"Text/part{i}.xhtml")
+                for i, title in enumerate(titles)
+            )),
+        }
+        for i, title in enumerate(titles):
+            entries[f"OEBPS/Text/part{i}.xhtml"] = XHTML.format(
+                body=f"<h1>{title}</h1><p>{title}的正文。</p>"
+            )
+        imp = read_epub_with_report(_epub(tmp, entries))
+
+    front_titles = titles[:-2]  # 序曲是正文章节，不是前附
+    assert [ch.title for ch in imp.book.chapters] == ["前附", *titles], [
+        ch.title for ch in imp.book.chapters
+    ]
+    assert imp.book.front_matter == [], [p.text for p in imp.book.front_matter]
+    assert imp.report["front_matter_entries"] == len(front_titles), imp.report
+    for i, title in enumerate(front_titles, start=1):
+        assert [p.text for p in imp.book.chapters[i].paragraphs] == [f"{title}的正文。"]
+    assert imp.book.chapters[-1].title == "第一章 开端"
+
+    # 打包后目录保留前附入口；第一章文件从自己的章标题开始，不再背着前附。
+    book = from_dict(json.loads(json.dumps(to_dict(imp.book))))
+    data = build_epub(book, modified=FIXED_MODIFIED).data
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        nav = zf.read("OEBPS/nav.xhtml").decode("utf-8")
+        assert all(f">{title}</a>" in nav for title in titles), nav
+        root = ET.fromstring(nav)
+        ns = {"x": "http://www.w3.org/1999/xhtml"}
+        top = root.find(".//x:nav/x:ol", ns)
+        top_items = top.findall("x:li", ns)
+        labels = ["".join(li.find("x:a", ns).itertext()) for li in top_items]
+        assert labels == ["前附", "序曲", "第一章 开端"], labels
+        front_children = top_items[0].findall("x:ol/x:li", ns)
+        assert [
+            "".join(li.find("x:a", ns).itertext()) for li in front_children
+        ] == front_titles, front_titles
+        assert top_items[1].find("x:ol", ns) is None
+        assert top_items[2].find("x:ol", ns) is None
+        first_href = re.search(
+            r'<a href="([^"]+)">第一章 开端</a>', nav
+        )
+        assert first_href is not None, nav
+        first = zf.read("OEBPS/" + first_href.group(1)).decode("utf-8")
+    assert "<body>\n<h1>第一章 开端</h1>" in first
+
+
+def case_cover_page_dropped_like_toc() -> None:
+    """封面重复页跟目录页走同一条路：整页丢弃，不占章节、也不进前附。
+
+    三类页都在这里：《谁的问题》的「书名页」—— 封面与版权页已经写着书名与
+    作者，再排一页只有这两行；《象首迷宫》目录里的「书封」—— 整页只有一张
+    封面图，而封面图由打包器重做；导航里直接叫「封面」的页面 —— 同一件事最
+    常见的写法。判据与目录页同一口径：去掉空白后含关键词，「书名页」
+    「书名：…」「书封」「封面」都算。
+
+    作者名不许跟着这一页一起丢：它来自 OPF 的 dc:creator，不是正文。
+    """
+    docs = [
+        ("书封", "cover"),
+        ("封面", "cv"),
+        ("书名页", "name"),
+        ("版权信息", "copy"),
+        ("第一章 开端", "ch1"),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        entries = {
+            "OEBPS/content.opf": _opf(
+                spine=[k for _, k in docs],
+                manifest=[
+                    (k, f"Text/{k}.xhtml", "application/xhtml+xml", "") for _, k in docs
+                ]
+                + [("ncx", "toc.ncx", "application/x-dtbncx+xml", "")],
+            ),
+            "OEBPS/toc.ncx": _ncx(
+                "".join(_navpoint(t, f"Text/{k}.xhtml") for t, k in docs)
+            ),
+            "OEBPS/Text/cover.xhtml": XHTML.format(
+                body="<h1>书封</h1><p>封面式样</p>"
+            ),
+            "OEBPS/Text/cv.xhtml": XHTML.format(
+                body="<h1>封面</h1><p>一张图占满整页</p>"
+            ),
+            "OEBPS/Text/name.xhtml": XHTML.format(
+                body="<h1>书名页</h1><p>测试书</p><p>某作者</p>"
+            ),
+            "OEBPS/Text/copy.xhtml": XHTML.format(
+                body="<h1>版权信息</h1><p>书名：测试书</p><p>出版社：某社</p>"
+            ),
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body="<h1>第一章 开端</h1><p>正文第一段。</p>"
+            ),
+        }
+        imp = read_epub_with_report(_epub(tmp, entries))
+
+    book = imp.book
+    assert [ch.title for ch in book.chapters] == [
+        "前附",
+        "版权信息",
+        "第一章 开端",
+    ], [ch.title for ch in book.chapters]
+    # 三页都整页不在了：标题与页里那几段一个都不许漏进别的章
+    texts = [p.text for p in _all_paragraphs(book)]
+    assert "书封" not in texts, texts
+    assert "封面式样" not in texts, texts
+    assert "封面" not in texts, texts
+    assert "一张图占满整页" not in texts, texts
+    assert "书名页" not in texts, texts
+    assert "测试书" not in texts, texts
+    assert "某作者" not in texts, texts
+    # 版权页自己的「书名：…」是版权信息的一部分，照旧保留
+    assert "书名：测试书" in texts, texts
+    assert imp.report["cover_pages_dropped"] == 3, imp.report
+    assert book.author == "某作者", book.author
+
+
+def case_book_title_not_front_word() -> None:
+    """「书名」不再算前附词：书名页由 _is_cover_page 整页丢弃。
+
+    两条判据的匹配口径完全相同（_norm_key 去掉空白后按「包含」比对），词表里
+    留着「书名」永远不会被 _is_front_title 用到 —— 是死词。锁住这一条，是为了
+    防止将来把 _is_cover_page 挪到别处时，书名页悄悄退回「前附」。
+    """
+    for title in ("书名页", "书名：测试书", "书名　作者"):
+        assert _is_front_title(title) is False, title
+
+
 def main() -> int:
     cases = [
         case_epub2_basic_split,
+        case_front_entries_keep_titles_and_chapter_boundaries,
+        case_cover_page_dropped_like_toc,
+        case_book_title_not_front_word,
         case_leading_body_title_echo_is_dropped,
         case_epub3_nav_parse,
         case_multi_anchor_split,
         case_anchor_missing_fallback,
         case_unanchored_first_node_owns_doc_head,
+        case_missing_anchor_matches_unique_heading,
+        case_toc_depth_survives_import_and_roundtrip,
         case_piece_merge,
         case_image_ratio_classes,
         case_decorative_and_orphan,
@@ -2597,8 +2867,8 @@ def main() -> int:
         case_dangling_ref_restored_to_text,
         case_note_leading_backlink_dropped,
         case_note_heading_dropped,
-        case_cover_page_dropped_like_toc,
         case_generated_info_page_skipped,
+        case_front_xu_titles,
         case_back_cover_page_skipped,
         case_back_cover_guide_fallback,
         case_back_cover_not_in_spine_not_reported_orphan,

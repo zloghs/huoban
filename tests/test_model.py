@@ -372,19 +372,36 @@ def case_version_guard() -> None:
     """主版本号不认识时必须报错，不能按旧语义读出一本错位的书。
 
     v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），v3 相对 v2
-    只多一个 rows（table 段专用），v4 相对 v3 只多一个 refs[].text（自带注文），
-    v5 相对 v4 只多一个 Chapter.refs（标题注），旧文件按新版本读入都无损 ——
-    所以 1/2/3/4/5 都要接受；其余主版本仍然拒绝。
+    只多一个 rows（table 段专用），v4 增加 refs[].text，v5 增加 Chapter.refs，
+    v6 增加可选目录深度。旧文件按新版本读入都无损；其余主版本仍然拒绝。
     """
-    for good in ("1", "2", "3", "4", "5", "5.0", "1.5.9-rc"):
+    for good in ("1", "2", "3", "4", "5", "6", "6.0", "1.5.9-rc"):
         ok = from_dict({"version": good, "chapters": []})
         assert isinstance(ok, Book), good
-    for bad in ("0", "6", "9.0"):
+    for bad in ("0", "7", "9.0"):
         try:
             from_dict({"version": bad, "chapters": []})
         except ValueError:
             continue
         raise AssertionError(f"版本 {bad} 应该被拒绝")
+
+
+def case_toc_depth_roundtrip() -> None:
+    """显式目录深度独立于卷章样式，存盘读回不能消失；旧树不补字段。"""
+    raw = to_dict(_sample_book())
+    raw["chapters"][0]["toc_depth"] = 0
+    raw["chapters"][1]["toc_depth"] = 2
+    back = to_dict(from_dict(raw))
+    assert back["chapters"][0].get("toc_depth") == 0, back["chapters"][0]
+    assert back["chapters"][1].get("toc_depth") == 2, back["chapters"][1]
+    assert back == raw
+    assert all("toc_depth" not in c for c in to_dict(_sample_book())["chapters"])
+    for legacy_version in ("1", "2", "3", "4", "5"):
+        legacy = to_dict(_sample_book())
+        legacy["version"] = legacy_version
+        migrated = to_dict(from_dict(legacy))
+        legacy["version"] = SCHEMA_VERSION
+        assert migrated == legacy
 
 
 def case_framed_heading_keeps_its_number() -> None:
@@ -613,6 +630,7 @@ def main() -> int:
         case_stats,
         case_save_load_identical,
         case_version_guard,
+        case_toc_depth_roundtrip,
         case_table_rows_roundtrip,
         case_validate_table,
         case_v1_tree_reserializes_unchanged,

@@ -49,7 +49,11 @@ from .diagnose import cn_to_int, match_chapter, strip_frame
 #
 # v4 → v5（标题注）：Chapter 新增 refs 字段，装写在标题里的注码。同样是**纯增量**：
 # 老树的章节没有这个键，读入后是空列表，重新序列化也不写它。
-SCHEMA_VERSION = "5"
+#
+# v5 → v6（原目录层级）：Chapter 新增可选 toc_depth，记原 EPUB 的目录深度。
+# 同样**纯增量**：旧树没有这个键，读入后是 None，仍按 level 推断卷章关系，
+# 重新序列化也不写它。
+SCHEMA_VERSION = "6"
 
 # 段落类型。渲染层按这个决定排版，清洗层按这个标注，两边共用同一份取值。
 # verse = 诗词/韵文（词曰、诗云、右调·XXX 之类）：本质是"引文"，
@@ -100,15 +104,6 @@ class Paragraph:
     # 清洗 TXT 那条线永远不写这两个字段，to_dict 也只在非空时才写。
     anchor: str = ""
     refs: list[dict] = field(default_factory=list)
-    # 这一段在**清洗前原文**里的起始行号（1 基），只有清洗 TXT 那条线会填。
-    # **不进 JSON、不参与序列化**（`_paragraph_to_dict` 不写它，schema 不变）。
-    # 为什么需要它：段落树里"注文续行"和"紧跟的正文"长得一模一样，光看文字
-    # 分不开。原文行号是唯一可靠证据 —— 续行必须紧挨上一行（见
-    # clean.py 的 `_strip_note_marks`）。EPUB 导入那条线留 0（没有原文行号）。
-    src_line: int = 0
-    # 这一段**覆盖到的原文末行号**（并碎行会把后面几行吸收进来）。
-    # 0 表示"与 src_line 相同"。同样不进 JSON。续行判定要拿它算相邻。
-    src_line_end: int = 0
     # 以下字段只在 kind == "table" 时有意义（schema v3，EPUB 导入专用）：
     # 整张表的二维网格，rows[行][列] = 一个单元格 dict：
     #   {"text": 文字, "header": 是不是表头格（<th>）,
@@ -118,6 +113,15 @@ class Paragraph:
     # 一律走 normalize_rows() 归一：列数不齐、span 越界、格子写成裸字符串
     # 都在那一处收敛，渲染层只认规范形态。
     rows: list[list[dict]] = field(default_factory=list)
+    # 这一段在**清洗前原文**里的起始行号（1 基），只有清洗 TXT 那条线会填。
+    # **不进 JSON、不参与序列化**（`_paragraph_to_dict` 不写它，schema 不变）。
+    # 为什么需要它：段落树里"注文续行"和"紧跟的正文"长得一模一样，光看文字
+    # 分不开。原文行号是唯一可靠证据 —— 续行必须紧挨上一行（见
+    # clean.py 的 `_strip_note_marks`）。EPUB 导入那条线留 0（没有原文行号）。
+    src_line: int = 0
+    # 这一段**覆盖到的原文末行号**（并碎行会把后面几行吸收进来）。
+    # 0 表示"与 src_line 相同"。同样不进 JSON。续行判定要拿它算相邻。
+    src_line_end: int = 0
 
 
 @dataclass
@@ -141,6 +145,12 @@ class Chapter:
     # 挪进正文，位置差几个字；存进这里之后注码能原样回到标题末尾。
     # 清洗 TXT 那条线永远不写它，to_dict 也只在非空时才写。
     refs: list[dict] = field(default_factory=list)
+    # 原 EPUB 的目录深度（schema v6），0 是顶层；None 表示旧章节树或 TXT，
+    # 打包时按 level 推断目录。
+    # 为什么不复用 level：两者回答的不是同一个问题。level 只说"正文怎么排版"
+    # （卷/章），目录深度说"原书怎么分组"。有子项的不一定是卷，分组结束后也可以
+    # 回到顶层叶子 —— 后记被排到末章下面，靠 level 永远看不出来。
+    toc_depth: int | None = None
 
 
 @dataclass
@@ -151,9 +161,9 @@ class Book:
     author: str = ""
     encoding: str = ""
     source: str = ""
-    # 第一个章节之前的内容：序章以外的前言、版权页、广告残留、目录块。
-    # 单独存而不是硬塞进第一章，是因为它的排版和归属都不确定，
-    # 留给渲染层决定"丢弃 / 当扉页 / 当前言"。
+    # 第一个章节之前、又不在原目录里的零散内容（广告残留、无标题扉页）。
+    # 有目录的 EPUB 会把前附条目收成「前附」卷及其子章，不落在这里；
+    # 这些零散段落由渲染层收进前附卷的卷首页，既不丢，也不挤进第一章。
     front_matter: list[Paragraph] = field(default_factory=list)
     chapters: list[Chapter] = field(default_factory=list)
     # 最后一个章节之后的内容：后记、全书完、作者的话、广告尾巴。
@@ -511,6 +521,8 @@ def _chapter_to_dict(ch: Chapter) -> dict:
     # 除 version 外应当逐字节不变。
     if ch.refs:
         out["refs"] = [_ref_to_dict(r) for r in ch.refs]
+    if ch.toc_depth is not None:
+        out["toc_depth"] = ch.toc_depth
     return out
 
 
@@ -553,6 +565,7 @@ def _chapter_from_dict(raw) -> Chapter:
     if not isinstance(raw, dict):
         return Chapter(title=str(raw))
     title = raw.get("title")
+    depth = _as_optional_int(raw.get("toc_depth"))
     return Chapter(
         title="" if title is None else str(title),
         number=_as_optional_int(raw.get("number")),
@@ -560,6 +573,7 @@ def _chapter_from_dict(raw) -> Chapter:
         start_line=_as_int(raw.get("start_line"), 0),
         paragraphs=[_paragraph_from_dict(x) for x in _as_list(raw.get("paragraphs"))],
         refs=_normalize_refs(raw.get("refs")),
+        toc_depth=depth if depth is not None and depth >= 0 else None,
     )
 
 
@@ -599,14 +613,11 @@ def from_dict(d: dict) -> Book:
 
     version = str(d.get("version", SCHEMA_VERSION))
     major = version.split(".")[0].strip()
-    # v5 相对 v4 只是 Chapter 多一个 refs 字段（标题注），v4 相对 v3 只是 refs 的
-    # 条目多了一个可选的 text（自带注文），v3 相对 v2 只是 Paragraph 多一个默认
-    # 字段（table 段专用），v2 相对 v1 同理（image 段专用）—— 旧文件按新版本读入
-    # 都无损，所以五个主版本都接受；其余版本仍然拒绝，宁可当场报错，也不按不认识
-    # 的语义读出一本结构错位的书。
-    if major not in ("1", "2", "3", "4", "5"):
+    # 历次 schema 升级只增加可选字段，旧文件按新版本读入都无损；其余版本仍然拒绝，
+    # 宁可当场报错，也不按不认识的语义读出一本结构错位的书。
+    if major not in ("1", "2", "3", "4", "5", "6"):
         raise ValueError(
-            f"不认识的章节树版本 {version!r}（当前支持 1/2/3/4/{SCHEMA_VERSION}）："
+            f"不认识的章节树版本 {version!r}（当前支持 1 至 {SCHEMA_VERSION}）："
             "字段含义可能已变，拒绝按旧语义读出错误的章节结构"
         )
 

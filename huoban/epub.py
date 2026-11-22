@@ -599,10 +599,9 @@ def _render_paragraphs(
             items.append(("gap", "", None))
             continue
         if not _text_of(p.text).strip() and getattr(p, "refs", None):
-            # 没有文字、只剩注码的段：空行会把 refs 一起吞掉。这种段是
-            # 导入端的退路 —— 前言里的重复标题被剔除时，标题上的注码落在这里
-            # （见 epubread._carry_refs）。正文章节的标题注存进 Chapter.refs，
-            # 不走这条路；只有前言没有章节实体可挂。
+            # 没有文字、只剩注码的段：空行会把 refs 一起吞掉。旧版导入或手工
+            # 章节树可能在前言里留下这种段，渲染仍须兼容；当前 EPUB 中列入
+            # NCX/nav 的前附也有自己的 Chapter，标题注存进 Chapter.refs，不再制造这种退化段。
             items.append((kind, "", p))
             continue
         if kind == "image":
@@ -927,18 +926,19 @@ FRONT_MATTER_TITLE = "前附"
 
 
 def _front_matter_chapter(book: Book) -> Chapter | None:
-    """把书前内容包成一条 level=2 的「前附（卷）」；没有书前内容就返回 None。
+    """把书前剩下的零散内容包成一条 level=2 的「前附（卷）」；没有就返回 None。
 
     为什么在渲染层造这个节点、而不是让 clean 层产出（0.4.0 定的路线 B）：
-    EPUB 导入那条路填的是 book.front_matter（导入器认「序/前言/版权页」），
-    清洗层根本不经过它。只在 epub.py 这边合成，两条来源才会出同一个包。
+    清洗层不产出 front_matter，只有 EPUB 导入那条路会填。让两条来源共用同一个
+    渲染出口，产物结构才不会因为来自 TXT 还是 EPUB 而变。
 
     **它只活在渲染用的视图里**（见 _render_view），不写回章节树、不进 JSON：
     book.front_matter 与 SCHEMA_VERSION 一个字都不动。
 
-    level=2 是「卷」语义：正文那边 h1 带 class="vol"（字号更大、留白更多），
-    目录那边是一行可点的条目。序章/楔子/引子本来各自就是 level=1 的一章，
-    是它的**同级**、不是子项，所以这里不给它挂子章。
+    level=2 是「卷」语义：正文里 h1 带 class="vol"（字号更大、留白更多），目录里
+    是一行可点的条目。它在这里只装"目录之外的零散书前内容"；原目录里列出的前附
+    条目在导入端就已经是它的子章（层级由 Chapter.toc_depth 决定），不归这里管。
+    序章/楔子/引子各自是 level=1 的一章，是它的**同级**，也不挂进来。
     """
     if not book.front_matter or not book.chapters:
         # 没有书前内容 → 不出现这一条（不许凭空多一条空的前附）。
@@ -950,6 +950,7 @@ def _front_matter_chapter(book: Book) -> Chapter | None:
         number=None,
         level=2,
         start_line=0,
+        toc_depth=0,
         paragraphs=list(book.front_matter),
     )
 
@@ -1284,15 +1285,14 @@ def _is_volume(ch: Chapter) -> bool:
 
 
 def _is_front_volume(ch: Chapter) -> bool:
-    """这一条是不是渲染层合成的「前附（卷）」。
+    """这一条是不是「前附（卷）」。
 
-    判据取三个条件同时成立：level>=2（是卷）、没有编号（合成节点才有）、
-    标题恰好是 FRONT_MATTER_TITLE。**不改 schema、不加字段** —— 这是
-    渲染视图里唯一一个这样的节点（见 _front_matter_chapter）。
+    三个条件同时成立：level>=2（是卷）、没有编号、标题恰好是 FRONT_MATTER_TITLE。
+    它有两个来源 —— 渲染层从 front_matter 合成的，或导入端把原目录前附条目收进
+    同一卷后留下的真实节点。
 
-    为什么必须把它单独认出来：普通卷会"认领"它后面的章（挂在它下面当子项），
-    而前附后面紧跟的序章/楔子/第一章是它的**同级**，不是它的子项。
-    照普通卷处理，整本书的章会全挂到「前附」底下，目录变成一棵歪树。
+    必须单独认出来：普通卷会认领它后面的章。前附卷只认自己的子章，紧跟其后的
+    序章/第一章是它的**同级**；照普通卷处理，整本书都会挂到「前附」底下。
     """
     try:
         if int(_text_of(ch.level)) < 2:
@@ -1304,38 +1304,46 @@ def _is_front_volume(ch: Chapter) -> bool:
     return _text_of(ch.title) == FRONT_MATTER_TITLE
 
 
-def _toc_nodes(book: Book) -> list[tuple[int, list[int]]]:
-    """把章节树整理成目录的两个层级：[(顶层的章节下标, [它下面的章下标]), ...]。
+_TocNode = tuple[int, list["_TocNode"]]
 
-    规则（契约）：level=2 是卷，level=1 是章。
-    - 出现在任何卷之前的章，直接挂在顶层（不造一个假的"卷"把它们裹起来）；
-    - 卷下面的章挂进该卷；
-    - 卷本身没有下属章时也是叶子（"正文卷"这种光有标题没有章的形态确实存在）。
-    没有卷的书，所有章都在顶层 —— 目录自然就是平铺的，不需要特判。
 
-    「前附（卷）」例外（0.4.0）：它是卷、但没有子项，也不许认领后面的章。
-    所以它进顶层之后**不设置 volume_at** —— 后面的序章/第一章仍挂顶层。
+def _toc_nodes(book: Book) -> list[_TocNode]:
+    """把章节树排成目录树：每个节点是 (章节下标, 子节点)。
+
+    有 toc_depth 的（EPUB 导入）按原目录深度重建：栈里留着的都是尚未结束的祖先，
+    回到顶层时一并弹掉 —— 分组结束后，后面那条仍是顶层叶子，不会继续挂在前一个
+    分组下面（后记被排进末章就是这么来的）。深度跳级时挂到最近的上层节点；
+    连一个可用祖先都没有，就放到顶层。
+
+    没有 toc_depth 的旧树与 TXT 只能按 level 推断：卷前的章放顶层，卷后的章归入
+    当前卷。前附卷是这套推断里唯一的例外 —— 它可以有前附子章，但不认领后面的
+    序章/第一章，否则全书章节都会被挂到它下面。
     """
-    nodes: list[tuple[int, list[int]]] = []
-    # 记住"当前卷"的位置，而不是"最后一个节点"：没有卷的书里，上一个顶层节点
-    # 是一章而不是一卷，把下一章挂成它的子节点会把目录变成一条链。
-    volume_at: int | None = None
+    nodes: list[_TocNode] = []
+    stack: list[tuple[int, list[_TocNode]]] = []
+    in_volume = False
     for idx, ch in enumerate(book.chapters):
-        # 与正文用同一个 level 判据（_level_of 会打警告，这里只是读它的结论）：
-        # 两处各自解释 level 是上一版的真 bug —— level=3 的章节在目录里被当成卷，
-        # 在正文里却按章排版，读者点目录跳不到的层级就出来了。
-        if _is_volume(ch):
-            nodes.append((idx, []))
-            # 前附不认领后继章：它只是把自己那一页挂上顶层。
-            volume_at = None if _is_front_volume(ch) else len(nodes) - 1
-        elif volume_at is None:
-            nodes.append((idx, []))
+        volume = _is_volume(ch)
+        front = _is_front_volume(ch)
+        explicit = getattr(ch, "toc_depth", None)
+        if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+            depth = explicit
         else:
-            nodes[volume_at][1].append(idx)
+            depth = 0 if volume or not in_volume else 1
+        if volume:
+            # 前附卷只容纳自己的前附子章，不把后续正文认领成子项。
+            in_volume = not front
+        elif depth == 0:
+            in_volume = False
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        children: list[_TocNode] = []
+        (stack[-1][1] if stack else nodes).append((idx, children))
+        stack.append((depth, children))
     return nodes
 
 
-def _nav_ol(book: Book, nodes: list[tuple[int, list[int]]], depth: int) -> str:
+def _nav_ol(book: Book, nodes: list[_TocNode], depth: int) -> str:
     """递归生成 nav 的 <ol>。depth 只用来缩进（给人看），不影响语义。"""
     pad = "  " * depth
     if not nodes:
@@ -1360,7 +1368,7 @@ def _nav_ol(book: Book, nodes: list[tuple[int, list[int]]], depth: int) -> str:
         if children:
             lines.append(f"{pad}  <li{vol_cls}>")
             lines.append(f'{pad}    <a href="{href}">{label}</a>')
-            lines.append(_nav_ol(book, [(c, []) for c in children], depth + 2))
+            lines.append(_nav_ol(book, children, depth + 2))
             lines.append(f"{pad}  </li>")
         else:
             lines.append(f'{pad}  <li{vol_cls}><a href="{href}">{label}</a></li>')
@@ -1387,7 +1395,7 @@ def _nav_doc(lang: str, book: Book) -> str:
     return _xhtml_doc(lang, "目录", body, "Styles/main.css")
 
 
-def _ncx_navpoints(book: Book, nodes: list[tuple[int, list[int]]], depth: int, counter: list[int]) -> str:
+def _ncx_navpoints(book: Book, nodes: list[_TocNode], depth: int, counter: list[int]) -> str:
     """递归生成 navMap 的 navPoint。
 
     playOrder 必须按文档顺序连续递增（1,2,3…），不能按层级重置 ——
@@ -1406,7 +1414,7 @@ def _ncx_navpoints(book: Book, nodes: list[tuple[int, list[int]]], depth: int, c
         lines.append(f'{pad}  <content src="{src}"/>')
         if children:
             lines.append(
-                _ncx_navpoints(book, [(c, []) for c in children], depth + 1, counter)
+                _ncx_navpoints(book, children, depth + 1, counter)
             )
         lines.append(f"{pad}</navPoint>")
     return "\n".join(lines)
@@ -1415,7 +1423,11 @@ def _ncx_navpoints(book: Book, nodes: list[tuple[int, list[int]]], depth: int, c
 def _ncx_doc(book: Book, title: str, book_id: str) -> str:
     """EPUB2 时代的 toc.ncx（给不认 nav.xhtml 的老阅读器）。"""
     nodes = _toc_nodes(book)
-    depth = 2 if any(children for _, children in nodes) else 1
+
+    def tree_depth(items: list[_TocNode]) -> int:
+        return max((1 + tree_depth(children) for _, children in items), default=0)
+
+    depth = max(1, tree_depth(nodes))
     navmap = _ncx_navpoints(book, nodes, 2, [0])
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'

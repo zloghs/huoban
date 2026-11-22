@@ -267,6 +267,28 @@ def case_anchor_refs_roundtrip() -> None:
     assert json.dumps(to_dict(back), ensure_ascii=False) == json.dumps(data, ensure_ascii=False)
 
 
+def case_ref_with_own_text() -> None:
+    """引用可以自带注文（掌阅格式的书没有注释段落可指）。
+
+    这类引用没有落点，只有文字：JSON 里写 `text`、不写 `note`；再读回来必须
+    一字不差 —— 它是注文唯一的存身处，读丢一次，全书注释就少一段。
+    """
+    para = Paragraph(text="正文继续。", refs=[{"at": 2, "text": "注文一句。", "label": ""}])
+    book = Book(encoding="utf-8", title="书", chapters=[Chapter(title="第一章", number=1, level=1,
+                                              start_line=1, paragraphs=[para])])
+    data = to_dict(book)
+    written = data["chapters"][0]["paragraphs"][0]["refs"][0]
+    assert written == {"at": 2, "label": "", "text": "注文一句。"}, written
+    assert "note" not in written, written
+
+    back = from_dict(data)
+    assert back.chapters[0].paragraphs[0].refs == [
+        {"at": 2, "note": "", "label": "", "text": "注文一句。"}
+    ], back.chapters[0].paragraphs[0].refs
+    # 没有落点不是错误：渲染层把 text 渲成注标，不需要锚点
+    assert validate(book) == [], validate(book)
+
+
 def case_validate_refs() -> None:
     """锚点/引用里的 id 会原样拼进 xhtml 属性，必须过白名单校验。"""
     bad_anchor = Book(encoding="utf-8", chapters=[Chapter(title="一", number=1, level=1, start_line=1,
@@ -350,13 +372,14 @@ def case_version_guard() -> None:
     """主版本号不认识时必须报错，不能按旧语义读出一本错位的书。
 
     v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），v3 相对 v2
-    只多一个 rows（table 段专用），旧文件按新版本读入都无损 —— 所以 1/2/3
-    都要接受；其余主版本仍然拒绝。
+    只多一个 rows（table 段专用），v4 相对 v3 只多一个 refs[].text（自带注文），
+    v5 相对 v4 只多一个 Chapter.refs（标题注），旧文件按新版本读入都无损 ——
+    所以 1/2/3/4/5 都要接受；其余主版本仍然拒绝。
     """
-    for good in ("1", "2", "3", "3.0", "1.5.9-rc"):
+    for good in ("1", "2", "3", "4", "5", "5.0", "1.5.9-rc"):
         ok = from_dict({"version": good, "chapters": []})
         assert isinstance(ok, Book), good
-    for bad in ("0", "4", "9.0"):
+    for bad in ("0", "6", "9.0"):
         try:
             from_dict({"version": bad, "chapters": []})
         except ValueError:
@@ -376,6 +399,43 @@ def case_framed_heading_keeps_its_number() -> None:
     assert h.number == 1, h
     assert h.level == 1, h
     assert parse_heading("==========").family == "分隔线"
+
+
+def case_chapter_refs_roundtrip() -> None:
+    """标题注（Chapter.refs）要原样进出 JSON；没有时不产生这个键。
+
+    这是 schema v5 的增量：老树没有这个键，读进来是空列表，写回去也不能凭空
+    多出来 —— 否则"旧文件重新序列化后除 version 外逐字节不变"这条验收就破了。
+    """
+    book = Book(
+        encoding="utf-8",
+        chapters=[
+            Chapter(
+                title="作者生平述要",
+                level=1,
+                refs=[
+                    {"at": 6, "note": "n1", "label": ""},
+                    {"at": 2, "note": "", "label": "", "text": "自带注文的标题注。"},
+                ],
+            ),
+            Chapter(title="第二章", level=1),
+        ],
+    )
+    d = to_dict(book)
+    assert "refs" in d["chapters"][0], d["chapters"][0]
+    assert "refs" not in d["chapters"][1], d["chapters"][1]
+    assert d["version"] == SCHEMA_VERSION, d["version"]
+
+    back = from_dict(json.loads(json.dumps(d)))
+    assert back.chapters[0].refs == book.chapters[0].refs, back.chapters[0].refs
+    assert back.chapters[1].refs == [], back.chapters[1].refs
+
+    # 越界的标题注要报出来：渲染层会跳过它，注文却已经被搬走 —— 等于丢注
+    bad = Book(
+        encoding="utf-8",
+        chapters=[Chapter(title="短标题", level=1, refs=[{"at": 99, "note": "n1"}])],
+    )
+    assert any("行内引用的位置 99" in t for t in validate(bad)), validate(bad)
 
 
 def case_v1_tree_reserializes_unchanged() -> None:
@@ -548,6 +608,7 @@ def main() -> int:
         case_validate_volume_may_be_empty,
         case_validate_duplicate_volume_titles,
         case_anchor_refs_roundtrip,
+        case_ref_with_own_text,
         case_validate_refs,
         case_stats,
         case_save_load_identical,
@@ -555,6 +616,7 @@ def main() -> int:
         case_table_rows_roundtrip,
         case_validate_table,
         case_v1_tree_reserializes_unchanged,
+        case_chapter_refs_roundtrip,
         case_framed_heading_keeps_its_number,
     ]
     failed = 0

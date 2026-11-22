@@ -34,7 +34,15 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from .clean import _is_separator_line
-from .model import Book, Chapter, Paragraph, normalize_rows, parse_heading, table_plain_text
+from .model import (
+    Book,
+    Chapter,
+    Paragraph,
+    fit_refs,
+    normalize_rows,
+    parse_heading,
+    table_plain_text,
+)
 
 # 图片扩展名与 media-type。与 epub.py 的 _IMAGE_TYPES 保持一致（那边是打包侧）。
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif")
@@ -63,6 +71,11 @@ _MAGIC_GIF = b"GIF8"
 # 样本证伪：家具图的下限其实低到 11 次，5 落在 3–10 这条模糊带里。
 # 留下装饰图的代价是一本书里多几张废图，误删插图的代价是内容没了 —— 不对等。
 DECORATIVE_THRESHOLD = 10
+
+# 掌阅注标（`<img class="zhangyue-footnote" zy-footnote="注文">`）：整只标签抓下来
+# 再单独取 src —— 属性顺序不受我们控制，正则不能依赖固定顺序，否则换序后会静默失效。
+_ZY_NOTE_IMG_RE = re.compile(r"""<img\b[^>]*\bzy-footnote\s*=[^>]*>""", re.I)
+_IMG_SRC_RE = re.compile(r"""\bsrc\s*=\s*["']([^"']+)["']""", re.I)
 
 # 前言区的标题关键词（docs/gui-design.md 的「章节切分」一节里的「前附」）。只在前缀位置生效：一旦切出了第一
 # 个正文章节，后面再出现"序"字样的标题就一律当章节（番外里常有"序"）。
@@ -727,9 +740,14 @@ _NOTE_MARKER = re.compile(
 
 # 注释正文开头那个"〚3〛"：不是 href 链接时（有的书条目上只有 id），它就是一串
 # 死文字，得在转成 note 时剥掉 —— 否则每一条注释前面都顶着一个注码。
+# ⊙ / ◉ 是多看系的回指标记（`<a href="#noteref_1">⊙</a>` 指回正文的注码）：
+# 链接没被认成引用时，这个符号会以纯文字落在注文开头，读者点开弹窗第一眼
+# 看到的就是它（《啸风山庄》229 条注释全带）。
 _NOTE_LEAD = re.compile(
     r"^\s*(?:[〚\[【〔（(]\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[〛\]】〕）)]"
+    r"|[0-9０-９]{1,3}\s*(?:[\]）)\.、:：]\s*|\s+)"
     r"|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]"
+    r"|[⊙◉]"
     r"|注\s*[0-9０-９一二三四五六七八九十百]+)\s*"
 )
 
@@ -795,8 +813,10 @@ class _DocParser(html.parser.HTMLParser):
     ParseError；html.parser 是容错的，坏文档也能尽量抠出内容。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, key=None) -> None:
         super().__init__(convert_charrefs=True)
+        # 引用目标 → 全书唯一键。None 时按"只取片段名"处理（单篇解析的旧行为）。
+        self._key = key or (lambda href: href.split("#", 1)[1].strip() if "#" in href else "")
         self.items: list[list] = []
         # 每帧：[tag, attrs, 文本缓冲, 有子块, 有图, 行内引用, 是注释容器]
         self._frames: list[list] = []
@@ -872,6 +892,17 @@ class _DocParser(html.parser.HTMLParser):
             return self._frames[-1][5]
         return self._body_refs
 
+    def _on_zy_note(self, note_text: str) -> None:
+        """记一条自带注文的引用：注标处插哨兵，注文跟着这条引用走。
+
+        它压根不是图，所以不走 `_on_image`；文档里也没有注释块，这条引用没有
+        落点（frag 为空），文字全靠第四元带走。
+        """
+        self._ref_seq += 1
+        seq = self._ref_seq
+        self._append_raw("\x01%d\x02" % seq)
+        self._refs_sink().append((seq, "", "", _clean_text(note_text)))
+
     def _on_image(self, src: str, attrs: dict) -> None:
         src = (src or "").strip()
         if not src:
@@ -916,7 +947,11 @@ class _DocParser(html.parser.HTMLParser):
             # 脚注条目常以编号开头（"1 注释文字"），编号对重排没有意义。
             # 只对"别人的"脚注做这一步：自家产物里的 note 文本是章节树原文，
             # 动它就不是保真了（自家 note 的 class 恰好是 "note"，见 _CLASS_KINDS）。
-            text = re.sub(r"^[\[（(]?\s*\d{1,3}\s*(?:[\]）)\.、:：]\s*|\s+)", "", text) or text
+            # 走 _NOTE_LEAD 而不是就地再写一条正则：回指标记（多看系的 ⊙）、
+            # 圈号、〚3〛 是同一件事的几种写法，两处各写一套必然走偏。
+            lead = _NOTE_LEAD.match(text)
+            if lead:
+                text = text[lead.end():] or text
         item = ["text", text, kind]
         if refs:
             item.append(refs)
@@ -1092,8 +1127,27 @@ class _DocParser(html.parser.HTMLParser):
             self._skip = [tag, 1]
             return
         cls = (a.get("class") or "").lower()
+        # 掌阅弹注：注文写在注标图的 zy-footnote 属性里，文档没有注释块可指，
+        # 读成一条"自带注文"的引用（refs[].text）。必须排在通用 <img> 之前，
+        # 否则注标被当成插图，属性里那份注文（全书唯一副本）跟着丢掉。
+        if tag == "img" and (a.get("zy-footnote") or "").strip():
+            self._on_zy_note(a["zy-footnote"])
+            return
         if tag in ("a", "sup", "span", "img") and "duokan-footnote" in cls:
-            # 脚注引用处的图标/编号：图标本身由装饰图阈值挡掉，编号文字没意义。
+            # 多看式注码：`<a class="duokan-footnote" epub:type="noteref"
+            # href="#note_120"><span><img alt="note"/></span></a>`，图标只是一层
+            # 皮，**带片段的 href 才是真引用**。以前这里一律整块跳过，等于把
+            # 整本书的注码全部丢掉 —— 《啸风山庄》229 个 noteref 就是这么没的：
+            # 没有引用指向注文，注文段连带被当死 id 清掉，读起来像这本书没有注。
+            # 现在带落点的 <a> 按 noteref 收；只有没落点的图标/编号才跳过。
+            href = (a.get("href") or "").strip()
+            if tag == "a" and "#" in href:
+                self._ref = {
+                    "frag": self._key(href),
+                    "buf": [],
+                    "cand": False,
+                }
+                return
             self._skip = [tag, 1]
             return
         # 正文里的注释引用：<a type="noteref" href="#note1">[1]</a>。
@@ -1101,7 +1155,7 @@ class _DocParser(html.parser.HTMLParser):
         # 没有落点，交给 _resolve_refs 还原成纯文字，不硬造死链接。
         if tag == "a":
             href = (a.get("href") or "").strip()
-            frag = href.split("#", 1)[1].strip() if "#" in href else ""
+            frag = self._key(href)
             if "noteref" in _type_words(a):
                 self._ref = {"frag": frag, "buf": [], "cand": False}
                 return
@@ -1136,6 +1190,10 @@ class _DocParser(html.parser.HTMLParser):
             if not self._pending_anchor:
                 self._pending_anchor = anchor_id
         if tag == "img":
+            if self._ref is not None:
+                # 引用里的图标（多看式注码 `<a …><span><img alt="note"/></span></a>`）
+                # 是注码的外观，不是插图：收成 image 段会在正文里凭空多一张图。
+                return
             self._on_image(a.get("src") or a.get("data-src") or "", a)
             return
         if tag == "image":  # SVG 里的位图（<svg><image xlink:href="..."/></svg>）
@@ -1190,7 +1248,7 @@ class _DocParser(html.parser.HTMLParser):
                 self._ref_seq += 1
                 seq = self._ref_seq
                 self._append_raw("\x01%d\x02" % seq)
-                self._refs_sink().append((seq, frag, label))
+                self._refs_sink().append((seq, frag, label, ""))
             elif label:
                 # 没有 #片段：不是可跳转的引用，把显示文字原样放回正文。
                 self._append_raw(label)
@@ -1262,7 +1320,7 @@ def _resolve_sentinels(text: str, raw_refs: list, drop_leading: bool) -> tuple[s
     """
     if "\x01" not in text:
         return text, []
-    by_seq = {seq: (frag, label) for seq, frag, label in raw_refs}
+    by_seq = {seq: (frag, label, own) for seq, frag, label, own in raw_refs}
     pieces: list[str] = []
     kept: list[dict] = []
     pos = 0
@@ -1285,7 +1343,11 @@ def _resolve_sentinels(text: str, raw_refs: list, drop_leading: bool) -> tuple[s
             # 目标不在本文档也先留着：Calibre 这类书把正文和注释
             # 分成两个 xhtml 文件，注释的落点在别的文件里。真正的
             # 有效性由全书锚点表在 _finalize_refs 里统一裁决。
-            kept.append({"at": cur, "note": info[0], "label": info[1]})
+            if info[2]:
+                # 自带注文（掌阅注标）：没有落点可指，文字跟着这条引用走
+                kept.append({"at": cur, "note": "", "label": info[1], "text": info[2]})
+            else:
+                kept.append({"at": cur, "note": info[0], "label": info[1]})
         pos = m.end()
     pieces.append(text[pos:])
     return "".join(pieces), kept
@@ -1366,7 +1428,10 @@ def _finalize_refs(book) -> None:
                 continue
             note = ref.get("note") or ""
             label = ref.get("label") or ""
-            if note in anchors:
+            if ref.get("text"):
+                # 自带注文：没有落点可查，也就无所谓"死链接"，原样留下
+                kept.append({"at": pos, "note": "", "label": label, "text": str(ref["text"])})
+            elif note in anchors:
                 kept.append({"at": pos, "note": note, "label": label})
             else:
                 text = text[:pos] + label + text[pos:]
@@ -1380,13 +1445,17 @@ def _finalize_refs(book) -> None:
             if cell.get("refs"):
                 cell["text"], cell["refs"] = _fix_refs(cell["text"], cell["refs"])
 
-    # 被注释引用指到的段落就是注释本体。Calibre 和毛宗岗评本这类书，注释条目
-    # 没有任何 type 属性（<p><a id="pnote1">〚1〛</a>注文…</p>），唯一的线索
-    # 就是"正文里有一个注码指着它"。不转成 note 的话，正文里点得开、注释区
-    # 却还是普通正文 —— 阅读器不会弹窗，等于白链。
-    # 只认"注码落在段中间"的引用（at > 0）。注释段自己开头那个注码是指回
-    # 正文的反向链接（at == 0），拿它当判据会把整段正文转成注释 —— 实测
-    # 那样一本来会多出 3000 多个假注释段。
+    # 标题注同理：落点不存在时还原成纯文字（偏移跟着 label 修正）。
+    # 标题不是注释段，不参与下面"把正文段转成 note"那一趟。
+    for ch in book.chapters:
+        if ch.refs:
+            ch.title, ch.refs = _fix_refs(ch.title or "", ch.refs)
+
+    # 被注码指到的段落就是注释本体。Calibre 和毛宗岗评本这类书的注释条目没有
+    # 任何 type 属性（<p><a id="pnote1">〚1〛</a>注文…</p>），唯一线索就是"正文里
+    # 有注码指着它"；不转成 note，正文里点得开、注释区却还是普通正文。
+    # 只认 at > 0 的引用：注释段开头那个注码是指回正文的反向链接（at == 0），
+    # 拿它当判据会把整段正文转成注释 —— 实测一本来会多出 3000 多个假注释段。
     referenced = {
         r.get("note")
         for para in _iter_paragraphs(book)
@@ -1397,11 +1466,11 @@ def _finalize_refs(book) -> None:
         if para.kind != "body" or not para.anchor or para.anchor not in referenced:
             continue
         para.kind = "note"
-        # 开头那个指回正文的注码是反向链接：正文那边已经有一个指过来的了，
-        # 留着会在注释开头多印一个 〚1〛。
+        # 开头那个指回正文的注码是反向链接：正文那边已有一个指过来的，留着
+        # 会在注释开头多印一个 〚1〛。
         para.refs = [r for r in (para.refs or []) if r.get("at") != 0]
-        # 条目上只有 id、没有 href 时，注码根本不成链接，只是一串死文字 ——
-        # 这里把它剥掉，剩下的才是注释正文。剥掉的长度要从 refs 的偏移里减掉。
+        # 条目上只有 id、没有 href 时，注码不成链接、只是死文字：剥掉它，剩下的
+        # 才是注文；剥掉的长度要从 refs 的偏移里减掉。
         lead = _NOTE_LEAD.match(para.text or "")
         if lead:
             cut = lead.end()
@@ -1433,6 +1502,12 @@ def _drop_unreferenced_anchors(book) -> int:
             for ref in cell.get("refs") or []:
                 if isinstance(ref, dict) and ref.get("note"):
                     used.add(str(ref["note"]))
+    # 标题注也指着锚点：不算进来的话，注文段的 id 会被当死 id 清掉，
+    # 标题里的注码随即失去落点。
+    for ch in book.chapters:
+        for ref in getattr(ch, "refs", None) or []:
+            if isinstance(ref, dict) and ref.get("note"):
+                used.add(str(ref["note"]))
 
     dropped = 0
     for para in _iter_paragraphs(book):
@@ -1446,11 +1521,187 @@ def _drop_unreferenced_anchors(book) -> int:
     return dropped
 
 
-def _parse_doc(data: bytes) -> list[list]:
-    parser = _DocParser()
+# 章末注释区的小标题（「注释：」「注　释」）不是内容。注文被注码指到、变成 note
+# （掌阅弹注）之后，这个小标题没有任何注码指向，会以普通正文段留在章末 ——
+# 实测《鱼不存在》10 章各留一行孤零零的「注释：」。
+#
+# 判据是"整串相等"而不是"含注释二字"：正文里以注释开头的句子（"注释是理解
+# 的桥梁"）不能碰。写法枚举覆盖简繁与常见的「编者注/校注/尾注」。
+_NOTE_HEADING_WORDS = (
+    "注", "注释", "注釋", "註釋", "注解", "註解", "脚注", "腳註", "尾注",
+    "译注", "譯註", "编者注", "編者註", "校注", "注释说明", "注释表",
+)
+
+
+def _is_note_heading(text: str) -> bool:
+    """这段文字是不是注释区的小标题？（去空白、去尾部冒号后整串相等）"""
+    return _norm_key(text).rstrip("：:．.。,，、") in _NOTE_HEADING_WORDS
+
+
+def _drop_note_headings(book) -> int:
+    """删掉章末注释区的小标题，返回删掉的条数。
+
+    只在同一段落序列里它后面确实还有注释段时才删 —— 这是"它是注释区标题"
+    的证据。正文里单独成段的「注释」两个字（作者自己的小标题）后面没有注释段，
+    不会被牵连。
+
+    必须排在 `_drop_unreferenced_anchors` 之后：那一趟已经把没人指向的 id 清掉，
+    这里才能用 `para.anchor` 判断"这个标题是否正被某条链接指着"。还带着 anchor
+    的说明有链接落在这里，删段就断了链接，宁可留着。
+    """
+    dropped = 0
+    holders = [book.front_matter, book.tail_matter]
+    holders += [ch.paragraphs for ch in book.chapters]
+    for paras in holders:
+        keep = []
+        for i, para in enumerate(paras):
+            if (
+                para.kind == "body"
+                and not para.refs
+                and not para.anchor
+                and _is_note_heading(para.text or "")
+                and any(p.kind == "note" for p in paras[i + 1:])
+            ):
+                dropped += 1
+                continue
+            keep.append(para)
+        if len(keep) != len(paras):
+            paras[:] = keep
+    return dropped
+
+
+# ---------- 锚点命名空间 ----------
+
+# 解析期把"某份源文件里的某个片段"写成 `文件␟片段`。没有这一层，全书只按片段名
+# 索引锚点：一章一文件的书每章都从 note_1 编号，凑成一张表就互相覆盖，正文的注码
+# 全部指到同一批注文上（《谁的问题》103 条注文只剩 7 种）。␟ 是控制字符，
+# 这里以源路径和片段名不含它为前提，只作导入期的内部分隔符，不改 atom 的最终
+# id 规则；复合键会随解析结果进入 Book，并在 _finalize_refs 前由 _localize_anchors 收缩。
+_NS = "\x1f"
+
+
+def _doc_slug(name: str) -> str:
+    """源文件名 → 可作 id 前缀的短名（OEBPS/Text/part0008.xhtml → part0008）。"""
+    stem = posixpath.splitext(posixpath.basename(name or ""))[0]
+    return re.sub(r"[^0-9A-Za-z_-]+", "-", stem).strip("-") or "doc"
+
+
+def _doc_key(name: str, resolve):
+    """构造「本文件里的 href → 全书唯一锚点键」。
+
+    空片段（`href="chapter2.xhtml"`，目录链接那种）返回空串 —— 它不是锚点引用，
+    调用方据此把它当普通链接还原成文字。
+    """
+    here = posixpath.dirname(name)
+
+    def key(href: str) -> str:
+        href = (href or "").strip()
+        if not href:
+            return ""
+        path, _, frag = href.partition("#")
+        frag = frag.strip()
+        if not frag:
+            return ""
+        doc = name if not path else (resolve(path, here) or path)
+        return f"{doc}{_NS}{frag}"
+
+    return key
+
+
+def _namespace_items(items: list[list], key) -> None:
+    """给本篇的段落与表格单元格锚点套上同样的命名空间。"""
+    for item in items:
+        if item[0] == "anchor":
+            if item[1]:
+                item[1] = key("#" + item[1])
+        elif item[0] == "table":
+            for row in item[1]:
+                for cell in row:
+                    if cell.get("anchor"):
+                        cell["anchor"] = key("#" + cell["anchor"])
+
+
+def _iter_anchor_keys(book):
+    """遍历全书所有锚点与引用目标（解析期的复合键）。"""
+    for para in _iter_paragraphs(book):
+        yield para.anchor
+        for ref in para.refs or []:
+            if isinstance(ref, dict):
+                yield ref.get("note")
+        for cell in _iter_cells(para):
+            yield cell.get("anchor")
+            for ref in cell.get("refs") or []:
+                if isinstance(ref, dict):
+                    yield ref.get("note")
+    for ch in book.chapters:
+        for ref in getattr(ch, "refs", None) or []:
+            if isinstance(ref, dict):
+                yield ref.get("note")
+
+
+def _localize_anchors(book) -> None:
+    """把解析期的「文件␟片段」复合键收缩成最终 id。
+
+    规则只有一条：某个片段名全书只在一份源文件里出现过，就去掉前缀、原样留下；
+    多份文件都有同名片段时，各加自己的文件前缀（part0008-note_1）。这样既能让
+    每章的 note_1 各归各位，又不至于让自家产物重新导入时 id 越串越长 —— 产物里
+    的 id 已经唯一，第二趟走的正是"原样留下"这条，回环不动点保住。
+    """
+    owners: dict[str, set[str]] = {}
+    for key in _iter_anchor_keys(book):
+        if not key or _NS not in key:
+            continue
+        doc, _, frag = key.partition(_NS)
+        if frag:
+            owners.setdefault(frag, set()).add(doc)
+
+    prefix: dict[str, str] = {}
+    taken: set[str] = set()
+    for frag, docs in owners.items():
+        if len(docs) < 2:
+            continue
+        for doc in sorted(docs):
+            if doc in prefix:
+                continue
+            base = _doc_slug(doc)
+            name, n = base, 2
+            while name in taken:
+                name, n = f"{base}{n}", n + 1
+            prefix[doc] = name
+            taken.add(name)
+
+    def final(key: str) -> str:
+        if not key or _NS not in key:
+            return key
+        doc, _, frag = key.partition(_NS)
+        if len(owners.get(frag) or ()) < 2:
+            return frag
+        return f"{prefix.get(doc) or _doc_slug(doc)}-{frag}"
+
+    def fix_refs(refs) -> None:
+        for ref in refs or []:
+            if isinstance(ref, dict) and ref.get("note"):
+                ref["note"] = final(ref["note"])
+
+    for para in _iter_paragraphs(book):
+        if para.anchor:
+            para.anchor = final(para.anchor)
+        fix_refs(para.refs)
+        for cell in _iter_cells(para):
+            if cell.get("anchor"):
+                cell["anchor"] = final(cell["anchor"])
+            fix_refs(cell.get("refs"))
+    for ch in book.chapters:
+        fix_refs(getattr(ch, "refs", None))
+
+
+def _parse_doc(data: bytes, key=None) -> list[list]:
+    parser = _DocParser(key)
     parser.feed(data.decode("utf-8", "replace"))
     parser.close()
     items = parser.items
+    if key is not None:
+        _namespace_items(items, key)
     _resolve_refs(items)
     return items
 
@@ -1486,17 +1737,20 @@ def _is_toc_title(title: str) -> bool:
     return bool(key) and (key in _TOC_WORDS or (key.startswith("目录") and len(key) <= 4))
 
 
-def _split_positions(items: list[list], nodes: list[_NavNode]) -> list[int]:
+def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list[int]:
     """算出每个目录节点在 items 里的起始下标（单调不减）。
 
     正常情况靠 #anchor 定位；锚点丢了（破损/改名）就在相邻已知锚点之间
     均分 —— 宁可切得粗糙，也不能让第一个节点吞掉整篇、其余全是空章。
+    `key` 与解析时用的是同一份：items 里的锚点已带文件命名空间，目录片段
+    也要换成同一种键才比得上。
     """
     # 一个文档只对应一个目录节点、又没有 #fragment（绝大多数"一文件一章"的书
     # 都是这样，包括本工具自己打出来的 EPUB）：整篇文档都属于它，从 0 开始。
     # 不特殊处理的话下面的均分会把它从中间劈开，前半截被塞给上一章。
     if len(nodes) == 1 and not nodes[0].fragment:
         return [0]
+    to_key = key or (lambda frag: frag)
     anchor_at: dict[str, int] = {}
     for idx, item in enumerate(items):
         if item[0] == "anchor":
@@ -1504,8 +1758,9 @@ def _split_positions(items: list[list], nodes: list[_NavNode]) -> list[int]:
     pos: list[int | None] = [None] * len(nodes)
     prev = 0
     for i, node in enumerate(nodes):
-        if node.fragment and node.fragment in anchor_at and anchor_at[node.fragment] >= prev:
-            pos[i] = anchor_at[node.fragment]
+        want = to_key("#" + node.fragment) if node.fragment else ""
+        if want and want in anchor_at and anchor_at[want] >= prev:
+            pos[i] = anchor_at[want]
             prev = pos[i]
     i = 0
     while i < len(nodes):
@@ -1533,8 +1788,42 @@ def _split_positions(items: list[list], nodes: list[_NavNode]) -> list[int]:
     return [int(p or 0) for p in pos]
 
 
-def _drop_duplicate_heading(items: list[list], title: str) -> list[list]:
-    """去掉章节开头那个"和目录标题重复"的标题块。
+def _carry_refs(items: list[list], refs: list) -> list[list]:
+    """把被删标题块上的注码挪到后面第一块正文的开头。
+
+    这是**没有章节实体可挂时**的退化路径 —— 现在只剩前言会走到这里（前言不是
+    Chapter，存不下标题注；见 `Chapter.refs`）。正文里的章节由 `_new_chapter`
+    把注码挂到 `Chapter.refs`，位置不受影响。
+
+    为什么必须挪：章首标题与目录标题重复时整块会被剔掉，而掌阅注标是写在
+    标题里的（`<h1>第一章<img class="zhangyue-footnote" …></h1>`）。块一删，
+    注码跟着消失；随后 `_finalize_refs` 判定"没有任何引用指向这条注文"，
+    把注文也丢掉 —— 成品里注码和注文两样都不剩，读者完全看不出少了东西。
+    真样本《嘯風山莊》里就有三条注释是这么没的。
+
+    位置代价：注码本来在标题末尾，挪过去之后落在第一句之前，差几个字。
+    前言没有后续正文块时，退化成只带注码的空壳段落，
+    渲染层会把只带注码的空段照样输出。
+    """
+    if not refs:
+        return items
+    out = list(items)
+    for idx, item in enumerate(out):
+        if item[0] != "text" or item[2] in ("blank", "note"):
+            continue
+        old = item[3] if len(item) > 3 else []
+        # 多条注码不能全给 0：_inline_html 按 at 排序后遇到 at < pos 会跳过，
+        # 同一位置只插得进第一条。给 0,1,2… 让它们依次落在段首几个字之间。
+        limit = len(item[1])
+        moved = [{**r, "at": min(i, limit)} for i, r in enumerate(refs)]
+        out[idx] = [item[0], item[1], item[2], moved + list(old)]
+        return out
+    out.append(["text", "", "body", [{**r, "at": 0} for r in refs]])
+    return out
+
+
+def _drop_duplicate_heading(items: list[list], title: str) -> tuple[list[list], list]:
+    """去掉章节开头那个"和目录标题重复"的标题块，返回 (剩下的块, 被删块的注码)。
 
     真实样本里几乎每章正文开头都重复一遍章标题（宰执天下是
     `<h2 class="head"><b>第一章</b><br/> 劫后梦醒世事更</h2>`），
@@ -1546,15 +1835,18 @@ def _drop_duplicate_heading(items: list[list], title: str) -> list[list]:
        规则 2 的 heading 匹配对这种包完全不生效，成品里就是"标题 + 一模一样的
        一段正文"。这条要求**完全相等且只看开头**，所以吃不掉正常句子。
     2. 前 3 个标题块里允许互相包含（`第一章` 与 `第一章　劫后梦醒` 是同一章）。
+
+    注码不跟着标题一起消失：被删块上的 refs 单独交回调用方 —— 正文章节把它存进
+    `Chapter.refs`（打包时写回标题），前言只能交给 `_carry_refs` 挪进正文。
     """
     key = _norm_key(title)
     if not key:
-        return items
+        return items, []
     for idx, item in enumerate(items):
         if item[0] != "text" or item[2] == "blank":
             continue
         if item[2] != "note" and _norm_key(item[1]) == key:
-            return items[:idx] + items[idx + 1:]
+            return items[:idx] + items[idx + 1:], item[3] if len(item) > 3 else []
         break
     # 扫描范围：正文块不限个数 —— 本工具自己打出的 EPUB 会把"前言"折进第一个
     # 叶子章的章标题**之前**，前言可以很长（死灵之书 53 段，其中还有一个自己的
@@ -1567,11 +1859,11 @@ def _drop_duplicate_heading(items: list[list], title: str) -> list[list]:
         if item[2] == "heading":
             head = _norm_key(item[1])
             if head == key or (len(head) >= 4 and (head in key or key in head)):
-                return items[:idx] + items[idx + 1:]
+                return items[:idx] + items[idx + 1:], item[3] if len(item) > 3 else []
             headings_seen += 1
             if headings_seen >= 3:
                 break
-    return items
+    return items, []
 
 
 def _merge_pieces(chapters: list[Chapter]) -> tuple[list[Chapter], int, int]:
@@ -1813,6 +2105,8 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     img_re = re.compile(
         r"""(?:src|data-src|xlink:href|href)\s*=\s*["']([^"']+)["']""", re.I
     )
+    # 掌阅注标：注文已经当行内引用收走了，这张图只是按钮，不是插图。
+    zy_marks: Counter[str] = Counter()
     for name in spine_docs:
         if name in skip_docs:
             continue
@@ -1825,6 +2119,16 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
             target = _resolve_ref(m.group(1), posixpath.dirname(name), resolve)
             if target and target.lower().endswith(IMAGE_EXTS):
                 img_refs[target] += 1
+        for m in _ZY_NOTE_IMG_RE.finditer(text):
+            # 变量名别用 src：_import 的入参也叫 src（源文件路径），覆盖之后
+            # 报告里的来源会变成一个 re.Match 的 repr，没书名的书还会在
+            # `opf.title or src.stem` 上直接崩。
+            mark_src = _IMG_SRC_RE.search(m.group(0))
+            if mark_src is None:
+                continue
+            target = _resolve_ref(mark_src.group(1), posixpath.dirname(name), resolve)
+            if target:
+                zy_marks[target] += 1
     for item in opf.items.values():
         if item.media != "text/css":
             continue
@@ -1847,8 +2151,13 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         for resolved in [resolve(item.href, opf.base)]
         if resolved
     }
+    # 判装饰图要把注标图的那几次引用扣掉：注释多的书里同一个 note.png 会被
+    # 引几十次，照字面数就顶过阈值，报告里凭空多一条"丢弃 1 张装饰图"——
+    # 而它既没被丢（注文已经进引用），也不是装饰。
     decorative = sorted(
-        n for n, count in img_refs.items() if count > DECORATIVE_THRESHOLD
+        n
+        for n, count in img_refs.items()
+        if count - zy_marks.get(n, 0) > DECORATIVE_THRESHOLD
     )
     orphans = sorted(
         n for n in manifest_images if n not in img_refs and n not in css_refs and n != cover_name
@@ -1992,7 +2301,10 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         ch.number = heading.number if heading is not None else None
         chapters.append(ch)
         current = ch.paragraphs
-        _emit(_drop_duplicate_heading(items, title))
+        # 标题块被剔掉，但写在它里面的注码要留下 —— 挂到章节上，打包时写回 <h1>。
+        rest, title_refs = _drop_duplicate_heading(items, title)
+        ch.refs = fit_refs(title_refs, title)
+        _emit(rest)
         return ch
 
     if not nav_nodes:
@@ -2002,7 +2314,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
             except KeyError:
                 continue
             if _is_generated_page(items):
@@ -2032,7 +2344,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
             except KeyError:
                 continue
             nodes = nodes_by_doc.get(name, [])
@@ -2048,7 +2360,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continuation_docs += 1
                 _emit(items)
                 continue
-            positions = _split_positions(items, nodes)
+            positions = _split_positions(items, nodes, _doc_key(name, resolve))
             if positions and positions[0] > 0:
                 _emit(items[: positions[0]])
             for i, node in enumerate(nodes):
@@ -2061,9 +2373,11 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                     continue  # 目录页：丢弃
                 if not chapters_started and _is_front_title(title):
                     # 前缀位置的"序/版权/制作说明"归前言：不建章节。
+                    # 前言不是 Chapter，存不下标题注，注码只能挪进正文。
                     front_entries += 1
                     current = front
-                    _emit(_drop_duplicate_heading(seg, title))
+                    rest, refs = _drop_duplicate_heading(seg, title)
+                    _emit(_carry_refs(rest, refs))
                     continue
                 if not title:
                     title = posixpath.splitext(posixpath.basename(name))[0]
@@ -2116,12 +2430,19 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         chapters=merged,
         tail_matter=[],
     )
+    # 锚点的文件命名空间收掉：同名片段按文件分流，否则全书的 note_1 会认成
+    # 同一个落点（见 _localize_anchors）。必须排在 _finalize_refs 之前 ——
+    # 那一趟要靠最终 id 判"这个引用的落点到底在不在"。
+    _localize_anchors(book)
     # 全书都解析完了，现在才有资格判"这个引用指向的注释到底在不在"。
     _finalize_refs(book)
     # 引用裁完之后，反过来把没人指向的 id 清掉（Kobo 的 kobo.*、版式容器的
     # book-columns 这类）。必须排在 _finalize_refs 之后：那一趟要按完整锚点
     # 表判断引用是否还有落点，先删就分不清"落点不存在"和"落点被删了"。
     ids_dropped = _drop_unreferenced_anchors(book)
+    # 注文都定下来之后，章末那行「注释：」才有资格删：它后面确实跟着注释段，
+    # 说明它是注释区的标题而不是正文小标题（见 _drop_note_headings）。
+    note_headings_dropped = _drop_note_headings(book)
 
     fonts = sum(
         1 for item in opf.items.values()
@@ -2160,6 +2481,8 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         "merged_pieces": pieces,
         "front_matter_entries": front_entries,
         "toc_dropped": toc_dropped,
+        # 清掉的章末「注释：」小标题条数（注文进了弹注，标题没有下文）。
+        "note_headings_dropped": note_headings_dropped,
         # 原书带来、但未被保留 refs 指向的 id 条数（Kobo 的 kobo.*、容器 id）。
         # 数值大只说明这类 id 较多，不能据此判断原书是否分片或由何种工具生成。
         "ids_dropped": ids_dropped,

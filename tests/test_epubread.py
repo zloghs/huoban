@@ -1161,6 +1161,66 @@ def _all_paragraphs(book: Book) -> list[Paragraph]:
     return out
 
 
+def case_title_note_stays_on_chapter() -> None:
+    """章首标题里的注码要留在标题上，不跟着"重复标题"一起消失。
+
+    真样本《嘯風山莊》有三条注释是这么没的：注标写在 `<h1>` 里（
+    `<h1>作者生平述要<img class="zhangyue-footnote" …/></h1>`），标题又与
+    目录同名，`_drop_duplicate_heading` 把整块剔掉，注码随之消失；
+    `_finalize_refs` 再判定"没有引用指向这条注文"，把注文也丢掉 ——
+    成品里注码和注文两样都不剩，读者看不出少了东西。
+
+    现在注码存进 `Chapter.refs`（偏移相对标题文字），打包时写回 `<h1>`，
+    位置与源书一致 —— 不再落到正文第一句前面。
+    """
+    mark = (
+        '<img class="zhangyue-footnote" src="../Images/note.png" '
+        'alt="注" zy-footnote="{}"/>'
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        opf = _opf(
+            spine=["c1", "c2"],
+            manifest=[
+                ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("c2", "Text/ch2.xhtml", "application/xhtml+xml", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        )
+        ncx = _ncx(
+            _navpoint("第一章 开端", "Text/ch1.xhtml")
+            + _navpoint("第二章 转折", "Text/ch2.xhtml")
+        )
+        entries = {
+            "OEBPS/content.opf": opf,
+            "OEBPS/toc.ncx": ncx,
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body="<h1>第一章 开端" + mark.format("标题上的注。") + "</h1>"
+                "<p>正文第一段。</p>"
+            ),
+            "OEBPS/Text/ch2.xhtml": XHTML.format(
+                body="<h1>第二章 转折" + mark.format("只有标题的一章。") + "</h1>"
+            ),
+        }
+        book = read_epub(_epub(tmp, entries))
+
+        # 1) 标题照样被剔除，注码留在章节标题上，偏移是标题末尾，正文段干净
+        first = book.chapters[0]
+        assert [p.text for p in first.paragraphs] == ["正文第一段。"], [
+            p.text for p in first.paragraphs
+        ]
+        assert first.paragraphs[0].refs == [], first.paragraphs[0].refs
+        assert [r.get("text") for r in first.refs] == ["标题上的注。"], first.refs
+        assert first.refs[0]["at"] == len("第一章 开端"), first.refs
+
+        # 2) 整章只有标题：不再是"只带注码的空壳段"，标题注照样有地方待
+        second = book.chapters[1]
+        assert second.paragraphs == [], [p.text for p in second.paragraphs]
+        assert [r.get("text") for r in second.refs] == [
+            "只有标题的一章。"
+        ], second.refs
+
+
 def case_note_number_strip_only_foreign() -> None:
     """脚注编号剥离只对"别人的"脚注生效，且不许吃掉正文开头的数字。
 
@@ -1200,6 +1260,54 @@ def case_note_number_strip_only_foreign() -> None:
 
         notes = [p.text for p in book.chapters[0].paragraphs if p.kind == "note"]
         assert notes == ["注释甲。", "1943 年的旧事。", "7 条自家注。"], notes
+
+
+def case_duokan_noteref_icon_keeps_ref() -> None:
+    """多看式注码：`<a class="duokan-footnote" epub:type="noteref">` 里套着一个图标。
+
+    《啸风山庄》（下载的那个版本）229 个 noteref 全是这个形状。旧代码见 class
+    含 duokan-footnote 就整块跳过，引用一个都没留下 —— 注文段随即被判成"没人
+    指"，锚点又被当死 id 清掉，整本书读起来像没有注释。
+
+    要钉住三件事：引用留下（目标是注释条目的 id）、图标不收成插图、
+    注释条目的**容器** id 当锚点（正文的 `#note_1` 才有落点）。
+    """
+    body = XHTML.format(body=(
+        '<h2 id="c1">第一章</h2>'
+        '<p>正文开始'
+        '<a class="duokan-footnote" epub:type="noteref" href="#note_1" id="noteref_1">'
+        '<span id="k1"><img alt="note" src="../Images/f16.png" class="calibre14"/></span>'
+        "</a>继续。</p>"
+        '<aside epub:type="footnote"><ol class="duokan-footnote-content">'
+        '<li class="duokan-footnote-item" id="note_1"><p class="footnote">'
+        '<a href="#noteref_1"><span>⊙</span></a><span>第一条注。</span>'
+        "</p></li></ol></aside>"
+    ))
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = _epub(tmp, {
+            "OEBPS/content.opf": _opf(
+                spine=["c"],
+                manifest=[
+                    ("c", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                    ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                ],
+            ),
+            "OEBPS/toc.ncx": _ncx(_navpoint("第一章", "Text/ch1.xhtml")),
+            "OEBPS/Text/ch1.xhtml": body,
+        })
+        book = read_epub(path)
+
+    paras = _all_paragraphs(book)
+    refs = [r for p in paras for r in p.refs]
+    assert [r["note"] for r in refs] == ["note_1"], refs
+    # 注文条目自己的 id 成了锚点，正文的 #note_1 才落得住；
+    # 开头那个回指标记（⊙）也要剥掉，否则每条注释点开都先看到一个符号。
+    notes = [p for p in paras if p.kind == "note"]
+    assert [p.anchor for p in notes] == ["note_1"], notes
+    assert notes[0].text == "第一条注。", notes[0].text
+    # 注码图标不是插图：整本书不该多出一个 image 段
+    assert not [p for p in paras if p.kind == "image"], [p.text for p in paras if p.kind == "image"]
 
 
 def case_calibre_noteref_and_rearnote() -> None:
@@ -1409,6 +1517,69 @@ def case_note_leading_backlink_dropped() -> None:
         notes = [p for p in _all_paragraphs(book) if p.kind == "note"]
         assert len(notes) == 1, [p.kind for p in _all_paragraphs(book)]
         assert notes[0].text == "注文内容。", notes[0].text
+
+
+def case_note_heading_dropped() -> None:
+    """章末注释区的小标题（「注释：」）不是正文，不许留在书里。
+
+    《鱼不存在》的写法：正文之后 `<p class="notetitle">注释：</p>` 领起一串
+    `<p class="notecontent">`。注文被正文注码指到、转成 note（掌阅弹注）之后，
+    这个标题没有任何注码指向，就作为普通段落留在章末 —— 全 10 章各留一行
+    「注释：」，读者翻到章尾只看见一个没有下文的标题。
+
+    删它要有证据，不能只看字面：同一个段落序列里后面确实还有注释段，才说明
+    它是注释区的标题；正文里单独成段的「注释」两个字（作者小标题）不受牵连。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = _epub(
+            tmp,
+            {
+                "OEBPS/content.opf": _opf(
+                    spine=["c1", "c2"],
+                    manifest=[
+                        ("c1", "Text/c1.xhtml", "application/xhtml+xml", ""),
+                        ("c2", "Text/c2.xhtml", "application/xhtml+xml", ""),
+                        ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                    ],
+                ),
+                "OEBPS/toc.ncx": _ncx(
+                    _navpoint("第一章 开端", "Text/c1.xhtml")
+                    + _navpoint("第二章 转折", "Text/c2.xhtml")
+                ),
+                "OEBPS/Text/c1.xhtml": XHTML.format(
+                    body=(
+                        "<h1>第一章 开端</h1>"
+                        '<p>正文开头<a id="r1" href="#n1">[1]</a>接着写下去。</p>'
+                        '<p class="notetitle">注释：</p>'
+                        '<p class="notecontent"><a id="n1" href="#r1">[1]</a>这是注文。</p>'
+                        "<p>后面还有正文。</p>"
+                    )
+                ),
+                "OEBPS/Text/c2.xhtml": XHTML.format(
+                    body="<h1>第二章 转折</h1><p>注释</p><p>这两个字是正文里的小标题。</p>"
+                ),
+            },
+        )
+        imp = read_epub_with_report(path)
+        book = imp.book
+
+        # 1) 注释标题没了，正文段与注文段都还在，顺序不变
+        first = book.chapters[0]
+        assert [p.text for p in first.paragraphs] == [
+            "正文开头接着写下去。",
+            "这是注文。",
+            "后面还有正文。",
+        ], [p.text for p in first.paragraphs]
+        assert _kinds(first) == ["body", "note", "body"], _kinds(first)
+        assert imp.report["note_headings_dropped"] == 1, imp.report
+
+        # 2) 后面没有注释段的「注释」是作者自己的小标题，一个字都不许动
+        second = book.chapters[1]
+        assert [p.text for p in second.paragraphs] == [
+            "注释",
+            "这两个字是正文里的小标题。",
+        ], [p.text for p in second.paragraphs]
 
 
 def case_generated_info_page_skipped() -> None:
@@ -2137,6 +2308,174 @@ def case_table_roundtrip() -> None:
     assert got[0].text == "年代｜艾蜜莉·布朗忒大事\n1817｜珍·奥斯汀死。\n1818", got[0].text
 
 
+def case_same_fragment_name_in_two_chapters() -> None:
+    """两章各自从 note_1 起编号：注文不能串成一锅。
+
+    一章一文件的书，每章注释都从 note_1 重新编号（《谁的问题》15 章各一套）。
+    锚点只按片段名索引时，全书凑成一个字典同名互相覆盖：103 条注文只剩 7 种，
+    读者点开注码看到的是别章的文献 —— 比缺字更糟。修复后各章的 note_1 按
+    源文件分流（ch1-note_1 / ch2-note_1），互不干扰。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        def page(n: int, note: str) -> str:
+            return XHTML.format(
+                body=(
+                    f'<h2 id="h{n}">第{n}章 起</h2>'
+                    f'<p>正文{n}<a type="noteref" href="#note_1">[1]</a>继续。</p>'
+                    f'<aside id="note_1"><p>'
+                    f'<a type="noteref" href="#h{n}">[1]</a>{note}</p></aside>'
+                )
+            )
+
+        path = _epub(
+            tmp,
+            {
+                "OEBPS/content.opf": _opf(
+                    spine=["c1", "c2"],
+                    manifest=[
+                        ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                        ("c2", "Text/ch2.xhtml", "application/xhtml+xml", ""),
+                        ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                    ],
+                ),
+                "OEBPS/toc.ncx": _ncx(
+                    _navpoint("第1章 起", "Text/ch1.xhtml")
+                    + _navpoint("第2章 起", "Text/ch2.xhtml")
+                ),
+                "OEBPS/Text/ch1.xhtml": page(1, "甲的注文。"),
+                "OEBPS/Text/ch2.xhtml": page(2, "乙的注文。"),
+            },
+        )
+        book = read_epub(path)
+        allp = _all_paragraphs(book)
+        notes = [p for p in allp if p.kind == "note"]
+        assert [p.text for p in notes] == ["甲的注文。", "乙的注文。"], [p.text for p in notes]
+        # 同名片段在不同文件里，锚点必须分成两个
+        assert len({p.anchor for p in notes}) == 2, [p.anchor for p in notes]
+        assert all(p.anchor.endswith("note_1") for p in notes), [p.anchor for p in notes]
+        # 每章的注码要指回本章那条，而不是全指到最后一条
+        body_refs = [r["note"] for p in allp if p.kind == "body" for r in (p.refs or [])]
+        assert body_refs == [p.anchor for p in notes], (body_refs, [p.anchor for p in notes])
+
+        # 打包后每条注文仍落在自己的注标上（不再退化成同一条）
+        data = build_epub(book, modified=FIXED_MODIFIED).data
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            text = "".join(
+                zf.read(n).decode("utf-8") for n in zf.namelist() if n.endswith(".xhtml")
+            )
+        assert 'zy-footnote="甲的注文。"' in text and 'zy-footnote="乙的注文。"' in text, text
+
+
+def case_zhangyue_footnote_roundtrip() -> None:
+    """掌阅弹注回环：注文在注标图的属性里，重排必须把它读回成一条自带注文的引用。
+
+    这条链两头都容易断：读不回来 → 用户每导入导出一次，全书注释沉一层（注文
+    只在属性里，没有别的副本）；读成正文 → 注释跑到字里行间，看着像错版。
+    """
+    book = Book(
+        title="注标假书",
+        author="假作者",
+        source="X:/假/注标假书.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[
+                    Paragraph(text="假正文一。",
+                              refs=[{"at": 3, "text": "假注文，讲一件事。", "label": ""}]),
+                    Paragraph(text="假正文二。"),
+                ],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        built = build_epub(book, modified=FIXED_MODIFIED)
+        path = tmp / "self.epub"
+        path.write_bytes(built.data)
+        back = read_epub(path)
+        again = build_epub(back, modified=FIXED_MODIFIED)
+
+    paras = _all_paragraphs(back)
+    refs = [r for p in paras for r in p.refs]
+    assert [r.get("text") for r in refs] == ["假注文，讲一件事。"], refs
+    # 注文不许跑到正文里
+    assert "假注文" not in "".join(p.text for p in paras), [p.text for p in paras]
+    # 回环不动点：再打一遍，章节文件与第一遍逐字节相同
+    first = zipfile.ZipFile(io.BytesIO(built.data)).read("OEBPS/Text/chap0001.xhtml")
+    second = zipfile.ZipFile(io.BytesIO(again.data)).read("OEBPS/Text/chap0001.xhtml")
+    assert first == second, "回环第二遍的章节文件与第一遍不同"
+
+
+def case_report_source_is_the_file_path() -> None:
+    """导入报告里的来源必须是文件路径，不能被扫注标图时的局部变量顶掉。
+
+    回归：8e8ea9a 统计掌阅注标时写了一句 `src = _IMG_SRC_RE.search(...)`，
+    而 `src` 正是 `_import` 的入参（源文件 Path）。凡是带注标的书，报告里的
+    `source` 都变成 re.Match 的 repr，写进 book.json 之后界面上「原文件」
+    一栏显示成一串 match 对象；没有书名的书还会在 `opf.title or src.stem` 上崩。
+    """
+    book = Book(
+        title="来源假书",
+        author="假作者",
+        source="X:/假/来源.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[
+                    Paragraph(text="假正文里带一条注。",
+                              refs=[{"at": 4, "note": "n1", "label": "[1]"}]),
+                    Paragraph(text="假设注一。", kind="note", anchor="n1"),
+                ],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = tmp / "src.epub"
+        path.write_bytes(build_epub(book, modified=FIXED_MODIFIED).data)
+        report = read_epub_with_report(path).report
+    assert report["source"] == str(path), report["source"]
+
+
+def case_zhangyue_mark_is_not_a_picture() -> None:
+    """注标图不算插图：注释多的书里它会被引几十次，别让它顶成"装饰图"。
+
+    实情：阈值是 10 次。一本 60 条注的书，同一张 note.png 被引 60 次，照字面
+    数就过阈值，报告里会凭空多一条"丢弃 1 张装饰图"—— 而它既没被丢（注文已经
+    进了引用），也不是装饰。这条用例检查高频注标不会被误报为装饰图或孤儿图。
+    """
+    notes = [f"注{i}。" for i in range(12)]
+    book = Book(
+        title="注多假书",
+        author="假作者",
+        source="X:/假/注多假书.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[Paragraph(text=f"假正文{i}。", refs=[{"at": 3, "text": t, "label": ""}])
+                            for i, t in enumerate(notes)],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        built = build_epub(book, modified=FIXED_MODIFIED)
+        path = tmp / "self.epub"
+        path.write_bytes(built.data)
+        imp = read_epub_with_report(path)
+
+    report = imp.report
+    assert "note.png" not in report["images_decorative"], report["images_decorative"]
+    assert "note.png" not in report["images_orphan"], report["images_orphan"]
+    refs = [r for p in _all_paragraphs(imp.book) for r in p.refs]
+    assert len(refs) == 12, refs
+
+
 def main() -> int:
     cases = [
         case_epub2_basic_split,
@@ -2164,12 +2503,19 @@ def main() -> int:
         case_drop_unreferenced_anchors,
         case_table_caption_and_empty_rows,
         case_table_roundtrip,
+        case_zhangyue_footnote_roundtrip,
+        case_same_fragment_name_in_two_chapters,
+        case_report_source_is_the_file_path,
+        case_zhangyue_mark_is_not_a_picture,
+        case_title_note_stays_on_chapter,
         case_note_number_strip_only_foreign,
         case_calibre_noteref_and_rearnote,
+        case_duokan_noteref_icon_keeps_ref,
         case_marker_only_note_without_type_attr,
         case_note_box_container_propagates_kind,
         case_dangling_ref_restored_to_text,
         case_note_leading_backlink_dropped,
+        case_note_heading_dropped,
         case_generated_info_page_skipped,
         case_back_cover_page_skipped,
         case_back_cover_guide_fallback,

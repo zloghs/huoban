@@ -1276,12 +1276,29 @@ def case_notes_grouped() -> None:
     assert ".notes p.note:first-child" in css, "组内第一条注释不该再吃上边距"
 
 
-def case_noteref_links_and_footnote_type() -> None:
-    """正文里的引用渲成可点开的 noteref；注释段带 epub:type="footnote"。
+def _note_marks(root) -> list:
+    """正文里的掌阅注标（带 zy-footnote 的图片）。"""
+    return [i for i in root.findall(".//xhtml:img", NS) if i.get("zy-footnote") is not None]
 
-    弹注靠两样东西：正文 `<a epub:type="noteref" href="#id">`，
-    以及落点元素上的 `epub:type="footnote"`。缺后者时阅读器只当普通跳转，
-    不会弹窗 —— 实测的"弹注全部失效"就是这两层同时缺。
+
+def _css_em(block: str, prop: str) -> float:
+    """从一段 CSS 声明里取出某个属性的 em 数值。
+
+    只认 em：这里要断言的是"整块不比一个汉字宽"这层关系，不是某几个字符。
+    哪天有人改成 px 或 %，应当当场失败，让改的人自己说清为什么 —— 单位一变，
+    "一个汉字的位置"这句话就不成立了。
+    """
+    m = re.search(rf"\b{prop}:\s*([\d.]+)\s*em\b", block)
+    assert m, f"{prop} 不是以 em 声明：{block!r}"
+    return float(m.group(1))
+
+
+def case_note_hidden_and_inlined() -> None:
+    """注文进注标的属性、不进正文 —— 掌阅弹注的形态。
+
+    掌阅不认 `epub:type="noteref"`，它认 `img.zhangyue-footnote` 上的
+    `zy-footnote` 属性：注文整段写在属性里，点击弹窗。换过来正好是这本书要的
+    效果 —— 正文里一个字都不留，不必指望阅读器去"隐藏"一个注释块。
     """
     book = _book(_chapter("第一章", [
         Paragraph(text="正文开始继续。", refs=[{"at": 4, "note": "n1", "label": "[1]"}],
@@ -1290,24 +1307,166 @@ def case_noteref_links_and_footnote_type() -> None:
     ]))
     result = _build(book)
     root = _chapter_roots(result)[0]
-    links = root.findall(".//xhtml:a", NS)
-    assert len(links) == 1, links
-    link = links[0]
-    assert link.get("class") == "noteref"
-    assert link.get("href") == "#n1"
-    assert link.get("epub:type") or link.get(
-        "{http://www.idpf.org/2007/ops}type"
-    ) == "noteref", dict(link.attrib)
-    assert "".join(link.itertext()) == "[1]"
 
-    notes = [p for p in root.findall(".//xhtml:p", NS) if p.get("class") == "note"]
-    assert len(notes) == 1
-    assert notes[0].get("id") == "n1"
-    assert notes[0].get("{http://www.idpf.org/2007/ops}type") == "footnote", dict(notes[0].attrib)
+    # 1) 落点已经不在文档里，就不该再留一条指向它的链接
+    assert root.findall(".//xhtml:a", NS) == [], "正文里不该再有注释链接"
+    # 2) 触发处是一张注标图，注文写在它的属性里
+    marks = _note_marks(root)
+    assert len(marks) == 1, [dict(m.attrib) for m in marks]
+    assert marks[0].get("class") == "zhangyue-footnote", dict(marks[0].attrib)
+    assert marks[0].get("zy-footnote") == "注一。", dict(marks[0].attrib)
+    assert marks[0].get("src") == "../Images/note.png", marks[0].get("src")
+    # 3) 正文文字里不许出现注释原文
+    body_text = "".join(root.find("xhtml:body", NS).itertext())
+    assert "注一。" not in body_text, body_text
+    # 4) 注标图必须在包里、也在 manifest 里（少一样就是裂图）
+    assert "OEBPS/Images/note.png" in result.files, result.files
+    hrefs = {i.get("href"): i for i in _manifest(result)}
+    assert "Images/note.png" in hrefs, list(hrefs)
+    assert hrefs["Images/note.png"].get("media-type") == "image/png"
+    assert _read(result, "OEBPS/Images/note.png")[:8] == b"\x89PNG\r\n\x1a\n"
+    # 5) 尺寸由样式表定：掌阅会把注标缩到看不清，不能交给它
+    css = _text(result, "OEBPS/Styles/main.css")
+    assert "img.zhangyue-footnote" in css
+    # 6) 注标整块不比一个汉字宽：图 0.9em，且不套外框（margin / padding 全为
+    #    0）。曾经用"图 0.9em + 四周各 0.05em 内边距凑成 1em"的办法求稳，结果
+    #    在真机上整块宽出一个字。圆牌直径已经等于图片边长，相邻汉字自身也有字面空白；
+    #    再补 padding 只会缩小图并加宽占位。
+    block = css.split("img.zhangyue-footnote {", 1)[1].split("}", 1)[0]
+    width = _css_em(block, "width")
+    height = _css_em(block, "height")
+    assert 0 < width <= 1.0, f"注标宽 {width}em，比一个汉字还宽"
+    assert abs(height - width) < 1e-9, f"注标不是方的：{width} × {height}"
+    assert re.search(r"\bpadding:\s*0(?![.\d])", block), "注标不套外框：padding 必须为 0"
+    assert re.search(r"\bmargin:\s*0(?![.\d])", block), "注标不该有 margin 占位"
+    # 7) 尺寸只有样式表这一处来源：标签上不许挂 style，也不许写 width/height。
+    #    内联的优先级高于样式表，挂上去就等于让这一块失效；两份值再一漂开，
+    #    读者看到的到底是哪一份也说不清。
+    for attr in ("style", "width", "height"):
+        assert marks[0].get(attr) is None, f"注标标签上不该有 {attr}：{dict(marks[0].attrib)}"
 
 
-def case_noteref_cross_chapter_href() -> None:
-    """注释在另一章时，链接必须写成跨文件路径，否则跳过去是个空锚点。"""
+def case_note_mark_eats_cjk_spaces() -> None:
+    """注标两侧的空白跟着注码一起消失，英文词间的空白不动。
+
+    源文件常写成 `他说完。 [1] 屋里静下来`：注码换成注标图之后，那些空白就成了
+    注标左右凭空多出来的空隙，真机上看像"离前一个字、后一个字都远"。
+    左边一律吞，右边只在后面不是拉丁词时才吞 —— 所以 `note  here` 那两个空格
+    留在注标之后，英文的词间间隔不会丢。空白按 Unicode 算：中文书里 `\u3000`
+    （全角空格）比半角空格更常见，它在阅读器里就是一个字宽的空白。
+    """
+    book = _book(_chapter("第一章", [
+        Paragraph(text="他说完。  屋里静下来。", refs=[{"at": 4, "note": "n1"}], anchor="nr1"),
+        # 全角空格：一半在注码前、一半在注码后（导入的书两种都见得到）
+        Paragraph(text="他走了。\u3000\u3000屋里静下来。", refs=[{"at": 5, "note": "n2"}], anchor="nr2"),
+        Paragraph(text="他走了。\u3000屋里静下来。", refs=[{"at": 4, "note": "n3"}], anchor="nr3"),
+        # 不间断空格：导入时本会压成半角，但手写 JSON 里能直接出现
+        Paragraph(text="他走了。\u00a0屋里静下来。", refs=[{"at": 4, "note": "n4"}], anchor="nr4"),
+        # 注码贴在引号、省略号后面：它们不在汉字区，但仍是中文语境
+        Paragraph(text="他说完。”\u3000屋里静下来。", refs=[{"at": 5, "note": "n6"}], anchor="nr6"),
+        Paragraph(text="现已不存……\u3000也有一说。", refs=[{"at": 6, "note": "n7"}], anchor="nr7"),
+        # 注码跟在英文词后面（译作里地名、人名后挂注是常态）：空白同样要吞
+        Paragraph(text="山顶的Hall\u3000，位于山顶。", refs=[{"at": 8, "note": "n8"}], anchor="nr8"),
+        Paragraph(text="see the note  here.", refs=[{"at": 12, "note": "n5"}], anchor="nr5"),
+        Paragraph(text="注一。", kind="note", anchor="n1"),
+        Paragraph(text="注二。", kind="note", anchor="n2"),
+        Paragraph(text="注三。", kind="note", anchor="n3"),
+        Paragraph(text="注四。", kind="note", anchor="n4"),
+        Paragraph(text="注五。", kind="note", anchor="n5"),
+        Paragraph(text="注六。", kind="note", anchor="n6"),
+        Paragraph(text="注七。", kind="note", anchor="n7"),
+        Paragraph(text="注八。", kind="note", anchor="n8"),
+    ]))
+    # 序列化时去掉命名空间前缀，"<img" 这样的断言才读得懂
+    html = ET.tostring(_chapter_roots(_build(book))[0], encoding="unicode").replace("html:", "")
+
+    # 中文：注标紧贴前后两个汉字，一个空白都不剩
+    assert "他说完。<img" in html, html
+    assert ">屋里静下来。" in html
+    assert "。 屋里" not in html, "注标处的空格没吞掉"
+    assert "他走了。<img" in html, html
+    assert "\u3000" not in html, "注标处的全角空格没吞掉"
+    assert "\u00a0" not in html, "注标处的不间断空格没吞掉"
+    # 注码前是引号、省略号时同样不许留空白：中文语境不只看汉字
+    assert "。”<img" in html, html
+    assert "……<img" in html, html
+    assert "Hall<img" in html, html
+    # 英文：`note` 后紧跟注标，注标后那两个空格原样留着
+    assert "note<img" in html, html
+    assert ">  here." in html, html
+
+
+def case_note_ref_survives_line_strip() -> None:
+    """注码在段尾、或段落被拆成多行时，坐标换算不能让引用被裁掉。
+
+    真书上出现过两种形态，以前都把引用整条丢掉，而注文又已经从正文里拿掉 ——
+    这条注释就凭空消失了（书里一行字都不剩）：
+    - 列表式段落 `1981　“赖纯如”《魂归离恨天》台北：裕泰 [21]`：注码跟在行尾
+      空白之后，refs 的 at 正好等于整段长度；渲染时行尾空白被 strip 掉，at 越界；
+    - 段落里混进了裸换行（脏中间态），refs 的 at 是整段偏移，拆成两行后对不上。
+    """
+    book = _book(_chapter("中译本评述", [
+        Paragraph(
+            text="1981\u3000“赖纯如”《魂归离恨天》台北：裕泰 ",
+            refs=[{"at": 23, "note": "n1", "label": "[21]"}], anchor="nr1",
+        ),
+        Paragraph(
+            text="第一行没有注。\n第二行有注。",
+            refs=[{"at": 11, "note": "n2", "label": "[22]"}], anchor="nr2",
+        ),
+        Paragraph(text="此版本略有修改。", kind="note", anchor="n1"),
+        Paragraph(text="第二行的注。", kind="note", anchor="n2"),
+    ]))
+    xml = _text(_build(book), "OEBPS/Text/chap0001.xhtml")
+
+    # 1) 段尾的注码照样渲成注标，正文里不留注文
+    assert 'zy-footnote="此版本略有修改。"' in xml, xml
+    assert "裕泰<img" in xml, xml
+    # 2) 拆行后注码落在它本来那一行，不是被丢掉
+    assert 'zy-footnote="第二行的注。"' in xml, xml
+    assert "第二行<img" in xml, xml
+    assert "第一行没有注。" in xml, xml
+    # 3) 两条注都搬进注标了，注释段不该再出现在正文里
+    assert 'class="note"' not in xml, xml
+    # 4) 拆行时 anchor 只给第一行，否则同一文件里出现两个相同的 id
+    assert xml.count('id="nr2"') == 1, xml
+
+
+def case_title_note_rendered_in_heading() -> None:
+    """标题注要写回 <h1>，而且注文不能因此在正文里再印一遍。
+
+    注标可以写在章标题里（`<h1>作者生平述要<img class="zhangyue-footnote" …>`）。
+    导入时它存进 `Chapter.refs`（schema v5），打包时按偏移插回标题末尾 ——
+    以前没有这个位置，只能把注码挪到正文第一句前面，差几个字。
+
+    这里同时钉住另一半：注释账（`_note_plan`）必须把标题注算进"会渲出来的
+    引用"，否则两条路都错 —— 注文被搬进注标却没从正文里拿掉（印两遍），
+    或者自带注文的引用连注标图都不进包（注码消失）。
+    """
+    ch1 = _chapter("作者生平述要", [
+        Paragraph(text="正文第一段。"),
+        Paragraph(text="参考 Gaskell 的传记。", kind="note", anchor="n1"),
+    ])
+    ch1.refs = [{"at": len("作者生平述要"), "note": "n1", "label": ""}]
+    ch2 = _chapter("第二章", [Paragraph(text="自带注文的标题。")])
+    ch2.refs = [{"at": 3, "note": "", "label": "", "text": "标题自己带着的注。"}]
+    book = _book(ch1, ch2)
+
+    xml = _text(_build(book), "OEBPS/Text/chap0001.xhtml")
+    # 注码回到标题末尾，不是正文第一句前面
+    assert '<h1>作者生平述要<img class="zhangyue-footnote"' in xml, xml
+    assert 'zy-footnote="参考 Gaskell 的传记。"' in xml, xml
+    # 注文只在注标属性里出现一次，注释段不该再排进正文
+    assert xml.count("参考 Gaskell 的传记。") == 1, xml
+    assert 'class="note"' not in xml, xml
+
+    # 没有注释段可查、注文只在引用里的标题注，照样渲得出来
+    xml2 = _text(_build(book), "OEBPS/Text/chap0002.xhtml")
+    assert 'zy-footnote="标题自己带着的注。"' in xml2, xml2
+
+
+def case_note_cross_chapter_inlined() -> None:
+    """注释排在另一章（Calibre 习惯）时，注文照样进属性，那一章也不再留注文。"""
     book = _book(
         _chapter("第一章", [
             Paragraph(text="正文里引一处。", refs=[{"at": 2, "note": "n9", "label": "[9]"}])
@@ -1318,8 +1477,41 @@ def case_noteref_cross_chapter_href() -> None:
     )
     result = _build(book)
     roots = _chapter_roots(result)
-    link = roots[0].findall(".//xhtml:a", NS)[0]
-    assert link.get("href") == "chap0002.xhtml#n9", link.get("href")
+    assert [m.get("zy-footnote") for m in _note_marks(roots[0])] == ["第九条注。"]
+    # 注释章里不许再留一份：留着读者就会看到两遍（正文一次、注释区一次）
+    notes_text = "".join(roots[1].find("xhtml:body", NS).itertext())
+    assert "第九条注。" not in notes_text, notes_text
+    # 整章搬空要说一声，否则读者翻到一页只有标题的空白不知怎么回事
+    assert any("只剩标题" in w for w in result.warnings), result.warnings
+
+
+def case_orphan_note_kept_visible() -> None:
+    """没有注码指向的注释照旧排在章末：藏起来就等于删字。
+
+    TXT 清洗出来的按语、残缺书里丢了注码的注释都走这条路 —— 它们没有入口，
+    唯一的去处就是正文里那块注释区。
+    """
+    book = _book(_chapter("第一章", [
+        Paragraph(text="正文。"),
+        Paragraph(text="孤儿注。", kind="note", anchor="solo"),
+    ]))
+    result = _build(book)
+    root = _chapter_roots(result)[0]
+    assert "孤儿注。" in "".join(root.find("xhtml:body", NS).itertext())
+    assert _note_marks(root) == []
+    assert "OEBPS/Images/note.png" not in result.files, "没用到注标就不该把图塞进包"
+
+
+def case_note_text_carried_by_ref() -> None:
+    """引用自带注文（重排回来的形态）时直接出注标，不必有注释段。
+
+    掌阅格式的书里没有注释块可指，注文只能跟引用待在一起；回环时靠的就是这条。
+    """
+    book = _book(_chapter("第一章", [
+        Paragraph(text="正文开始。", refs=[{"at": 2, "text": "自带注文。", "label": ""}]),
+    ]))
+    marks = _note_marks(_chapter_roots(_build(book))[0])
+    assert [m.get("zy-footnote") for m in marks] == ["自带注文。"], [dict(m.attrib) for m in marks]
 
 
 def case_noteref_dangling_becomes_plain_text() -> None:
@@ -1541,8 +1733,13 @@ def main() -> int:
         case_modified_string_and_invalid,
         # 成品观感：分页留白 / 注释区 / 卷标题页
         case_page_break_and_spacing,
-        case_noteref_links_and_footnote_type,
-        case_noteref_cross_chapter_href,
+        case_note_hidden_and_inlined,
+        case_note_mark_eats_cjk_spaces,
+        case_note_ref_survives_line_strip,
+        case_title_note_rendered_in_heading,
+        case_note_cross_chapter_inlined,
+        case_orphan_note_kept_visible,
+        case_note_text_carried_by_ref,
         case_noteref_dangling_becomes_plain_text,
         case_notes_grouped,
         case_volume_title_page_standalone,

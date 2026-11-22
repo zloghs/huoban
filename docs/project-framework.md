@@ -14,6 +14,9 @@
       ├─ cleanreport.py/report.py  清洗账单与 markdown 报告
       └─ redact.py     脱敏：形状描述与代号（真书正文不进 AI 会话）
 
+    huoban/assets/      打包进电子书的资产（目前只有掌阅注标图 note.png）
+                        tools/make_note_mark.py 生成；登记见 docs/design-assets.md
+
     gui/               桌面界面（独立于上面这条线，只调用不改动）
       ├─ app.py        窗建 + 拖放注册 + 资源路径解析（全项目唯一一处）
       ├─ api.py        js_api：import_file / job_poll / review / apply_adjust / build_epub / preview_cover / pick_* / reveal_in_explorer

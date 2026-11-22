@@ -41,7 +41,15 @@ from .diagnose import cn_to_int, match_chapter, strip_frame
 # 段落上出现，同时 PARAGRAPH_KINDS 多一个 "table"。同样是**纯增量**：v1/v2 的
 # 章节树按 v3 读入后一个字段都不会变（from_dict 接受 1/2/3 三个主版本），
 # to_dict 也只在 table 段写 rows —— 旧文件重新序列化后除 version 外逐字节不变。
-SCHEMA_VERSION = "3"
+#
+# v3 → v4（注释改成掌阅弹注）：refs 的条目多一个可选的 text 字段，用来装"自带
+# 注文的引用"—— 掌阅格式的书里注文只在注标的属性里，全文档没有注释段落可以
+# 指向，文字只能跟引用待在一起。同样是**纯增量**：老树的引用没有 text，
+# 写出来的键序与 v3 一模一样；from_dict 四个主版本都接受。
+#
+# v4 → v5（标题注）：Chapter 新增 refs 字段，装写在标题里的注码。同样是**纯增量**：
+# 老树的章节没有这个键，读入后是空列表，重新序列化也不写它。
+SCHEMA_VERSION = "5"
 
 # 段落类型。渲染层按这个决定排版，清洗层按这个标注，两边共用同一份取值。
 # verse = 诗词/韵文（词曰、诗云、右调·XXX 之类）：本质是"引文"，
@@ -126,6 +134,13 @@ class Chapter:
     level: int = 1  # 1=章级，2=卷/部/集级
     start_line: int = 0  # 清洗前的行号（1 基）
     paragraphs: list[Paragraph] = field(default_factory=list)
+    # 标题里的行内引用（schema v5，EPUB 导入专用）。格式与 Paragraph.refs 相同，
+    # 偏移相对 `title`。为什么要单开一列：注码可以写在 `<h1>` 里
+    # （`<h1>作者生平述要<img class="zhangyue-footnote" …></h1>`），而标题是
+    # 打包时重新生成的，段落列表里没有它的位置。以前删重复标题时只能把注码
+    # 挪进正文，位置差几个字；存进这里之后注码能原样回到标题末尾。
+    # 清洗 TXT 那条线永远不写它，to_dict 也只在非空时才写。
+    refs: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -299,25 +314,73 @@ def _as_span(value) -> int:
 
 
 def _normalize_refs(raw) -> list[dict]:
-    """把 JSON 里的 refs 归一成 [{"at", "note", "label"}]，丢掉目标为空的条目。
+    """把 JSON 里的 refs 归一成 [{"at", "note", "label"[, "text"]}]。
 
-    段落与表格单元格共用这一份：两处各写一遍，迟早出现"段落里的偏移从 0 起、
-    单元格里的从 1 起"这种对不上的事。
+    两种引用共用这份结构：`note` 是注释段的 id（渲染层据此找注文）；`text` 是
+    引用自带的注文，没有落点 —— 掌阅格式的书就是这样，注文只存在 `zy-footnote`
+    属性里，文档里没有注释块可指。两者都没有的条目丢掉（拼不出任何东西）。
+
+    段落与表格单元格共用这一份：两处各写一遍，迟早出现偏移基准对不上的事。
     """
     out: list[dict] = []
     for r in _as_list(raw):
         if not isinstance(r, dict):
             continue
         note = r.get("note")
-        if not note:
+        text = r.get("text")
+        if not note and not text:
             continue
-        out.append(
-            {
-                "at": _as_int(r.get("at"), 0),
-                "note": str(note),
-                "label": "" if r.get("label") is None else str(r.get("label")),
-            }
-        )
+        item = {
+            "at": _as_int(r.get("at"), 0),
+            "note": "" if not note else str(note),
+            "label": "" if r.get("label") is None else str(r.get("label")),
+        }
+        if text:
+            item["text"] = str(text)
+        out.append(item)
+    return out
+
+
+def fit_refs(refs, text: str) -> list[dict]:
+    """把行内引用的偏移收进 `text` 的长度之内，返回新列表。
+
+    为什么需要：引用的偏移原本相对**源文件里的那块文字**，而挂上去的标题取
+    自目录条目，两者可能不等长（正文写「第一章　劫后梦醒」，目录只写「第一章」）。
+    越界的引用渲染层会跳过，可它指向的注文已经按"引用在"搬进了注标 ——
+    不钳就等于丢注。所以一律往回收，落到末尾；多条一起越界时向前错开一格，
+    否则同一位置只插得进第一条（渲染时遇到 at < pos 会跳过）。
+
+    导入端写标题注、打包端渲染标题都走这一份，口径必须一致：两边各写一套，
+    迟早出现"存进去的偏移合法、渲出来却被跳过"的事。
+    """
+    if not refs:
+        return []
+    limit = len(text)
+    last = len(refs) - 1
+    out: list[dict] = []
+    for i, ref in enumerate(refs):
+        try:
+            at = int(ref.get("at", 0))
+        except (TypeError, ValueError):
+            at = 0
+        out.append({**ref, "at": max(0, min(at, limit - (last - i)))})
+    return out
+
+
+def _ref_to_dict(ref: dict) -> dict:
+    """refs 的一条落盘形态：`note` / `text` 只在真有值时写。
+
+    沿用"空字段不写"的老规矩（v1 旧文件重新序列化必须逐字节不变）：
+    老树的引用没有 text，写出来的键序与以前完全一样。
+    """
+    out = {"at": int(ref.get("at", 0))}
+    note = str(ref.get("note", "") or "")
+    if note:
+        out["note"] = note
+    out["label"] = str(ref.get("label", "") or "")
+    text = str(ref.get("text", "") or "")
+    if text:
+        out["text"] = text
     return out
 
 
@@ -409,10 +472,7 @@ def _paragraph_to_dict(p: Paragraph) -> dict:
     if p.anchor:
         d["anchor"] = p.anchor
     if p.refs:
-        d["refs"] = [
-            {"at": int(r.get("at", 0)), "note": str(r.get("note", "")), "label": str(r.get("label", ""))}
-            for r in p.refs
-        ]
+        d["refs"] = [_ref_to_dict(r) for r in p.refs]
     return d
 
 
@@ -440,13 +500,18 @@ def _paragraph_from_dict(raw) -> Paragraph:
 
 
 def _chapter_to_dict(ch: Chapter) -> dict:
-    return {
+    out = {
         "title": ch.title,
         "number": ch.number,
         "level": ch.level,
         "start_line": ch.start_line,
         "paragraphs": [_paragraph_to_dict(p) for p in ch.paragraphs],
     }
+    # 只在真有标题注时才写这个键：老树（含 TXT 那条线的产物）重新序列化后
+    # 除 version 外应当逐字节不变。
+    if ch.refs:
+        out["refs"] = [_ref_to_dict(r) for r in ch.refs]
+    return out
 
 
 def _as_list(value) -> list:
@@ -494,6 +559,7 @@ def _chapter_from_dict(raw) -> Chapter:
         level=_as_int(raw.get("level"), 1),
         start_line=_as_int(raw.get("start_line"), 0),
         paragraphs=[_paragraph_from_dict(x) for x in _as_list(raw.get("paragraphs"))],
+        refs=_normalize_refs(raw.get("refs")),
     )
 
 
@@ -533,12 +599,14 @@ def from_dict(d: dict) -> Book:
 
     version = str(d.get("version", SCHEMA_VERSION))
     major = version.split(".")[0].strip()
-    # v3 相对 v2 只是 Paragraph 多了一个默认字段（table 段专用），v2 相对 v1
-    # 同理（image 段专用），旧文件按新版本读入都无损 —— 所以三个主版本都接受；
-    # 其余版本仍然拒绝，宁可当场报错，也不按不认识的语义读出一本结构错位的书。
-    if major not in ("1", "2", "3"):
+    # v5 相对 v4 只是 Chapter 多一个 refs 字段（标题注），v4 相对 v3 只是 refs 的
+    # 条目多了一个可选的 text（自带注文），v3 相对 v2 只是 Paragraph 多一个默认
+    # 字段（table 段专用），v2 相对 v1 同理（image 段专用）—— 旧文件按新版本读入
+    # 都无损，所以五个主版本都接受；其余版本仍然拒绝，宁可当场报错，也不按不认识
+    # 的语义读出一本结构错位的书。
+    if major not in ("1", "2", "3", "4", "5"):
         raise ValueError(
-            f"不认识的章节树版本 {version!r}（当前支持 1/2/{SCHEMA_VERSION}）："
+            f"不认识的章节树版本 {version!r}（当前支持 1/2/3/4/{SCHEMA_VERSION}）："
             "字段含义可能已变，拒绝按旧语义读出错误的章节结构"
         )
 
@@ -687,8 +755,12 @@ def validate_items(book: Book) -> list[dict]:
         """
         for ref in refs:
             note = str(ref.get("note") or "")
+            own_text = str(ref.get("text") or "")
             if not note:
-                _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用的目标为空：渲染层拼不出链接")
+                # 自带注文的引用没有落点：文字本身就是渲染层要写进属性的东西，
+                # 不写 text 又没 note 的条目才是坏的（渲染层拼不出任何东西）。
+                if not own_text.strip():
+                    _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用既没有目标也没有注文：渲染层拼不出东西")
             elif not _SAFE_ID.match(note):
                 _add("bad_ref", LEVEL_LAYOUT, f"{where}行内引用目标 {note!r} 不是安全的 HTML id")
             at = ref.get("at")
@@ -756,6 +828,9 @@ def validate_items(book: Book) -> list[dict]:
             _add("bad_level", LEVEL_ORDER,
                 f"{label}「{ch.title}」的 level={ch.level} 不在 1/2 之内（1=章级，2=卷/部/集级）"
             )
+        # 标题注的偏移相对标题文字：越界的条目渲染层会跳过，而它指向的注文
+        # 早已按"这条引用在"从正文里搬走 —— 不报就等于悄悄丢一条注。
+        _check_refs(ch.refs, ch.title, f"{label}「{ch.title}」标题")
         # 卷/部/集（level=2）是**容器标题**，正文都在它下面的章里，本身没有
         # 段落是正常形态。不豁免的话每本分卷的书都会报一条"正文可能丢了"，
         # 天天喊狼来了，真丢正文的时候人反而不看了。

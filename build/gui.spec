@@ -31,6 +31,13 @@ datas = [
     (str(GUI / "assets"), "gui/assets"),
 ]
 
+# 打包进电子书的资产（huoban/assets/）：epub.py 用 `__file__` 找同目录的
+# assets/，冻结后在 `_MEIPASS/huoban/assets` —— 正是这里的 target。缺了它，
+# exe 里打出来的书注码处是裂图（库层会报警告并退回注释排在正文里的老做法）。
+_PKG_ASSETS = PKG / "assets"
+if _PKG_ASSETS.is_dir():
+    datas.append((str(_PKG_ASSETS), "huoban/assets"))
+
 # 内嵌字库（fonts/，约 57MB）：思源宋体完整版 + 花园明朝 B。fonts.py 的
 # _font_dirs() 拿 __file__ 往上两级找 fonts/，冻结后在 _MEIPASS/fonts，
 # 正是这里的 target。不打包不会崩 —— 只是退回系统字体、扩展 B 区汉字出缺字

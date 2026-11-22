@@ -266,7 +266,7 @@ encoding / source / front_matter / chapters / tail_matter）**都不新增**。�
 <书目录>/示例书名/
   示例书名.txt        ← 只读，永不修改
   示例书名_gui/       ← GUI 产物目录（CLI 用 <名>_clean/，不撞）
-    book.json         model.to_dict()，SCHEMA_VERSION 为 1
+    book.json         model.to_dict()，版本号以 model.SCHEMA_VERSION 为准
     clean-report.md   cleanreport.render_clean_markdown(report)
     report.json       clean.py 的 report dict（键已冻结）
     adjust.json       复核勾选，见「adjust 接口」一节；同时是「这版产物带 12 处人工调整」的凭证
@@ -994,6 +994,11 @@ GUI **不用为导入新增视图**（2026-11-06 订正：原文写「五个视�
 `validate()` 补四条：`anchor` / `refs[].note` 必须是安全 id（白名单 `^[A-Za-z0-9_.:-]+$`，
 因为它们会原样拼进 xhtml 属性）、`at` 必须是非负整数且不超过本段长度。
 
+`at == len(text)` 是合法值，意思是"段末"—— 列表式段落 `…台北：裕泰 [21]` 的注码就在
+行尾空白之后。渲染时行首行尾的空白会被 strip、段内的裸换行会被拆成多个 `<p>`，偏移
+由 `epub._para_lines` 统一换算到行内；换算不进去的引用不渲染，也**不会**把它指向的
+注文搬走（搬走就等于把那句注释删掉）。
+
 ### 尺寸必须在解析时拿到，不能让打包层读图
 
 Pillow 在本项目里是**可选依赖**（照 `fonts.py:42-49` 的 `try/except ImportError` 降级范式），
@@ -1053,7 +1058,7 @@ JPEG 扫 SOF0/SOF2 段。GIF 同理（逻辑屏幕描述符 6–9 字节）。�
   <p><a type="noteref" href="part0007.html#noteref_1">[1]</a>祖斩白蛇。</p></aside></section>
 ```
 
-三层都要做，缺一层弹注就不工作：
+前两层在导入侧，第三层在输出侧，两边对的是同一套标记：
 
 1. **认类型**：判据统一走 `_type_words`（`epub:type` 与无前缀 `type` 拼起来看）。
    **注释语义常写在容器上、文字在子元素里** —— `<div type="footnote"><p>注文</p></div>`
@@ -1066,12 +1071,42 @@ JPEG 扫 SOF0/SOF2 段。GIF 同理（逻辑屏幕描述符 6–9 字节）。�
    在 `read_epub` 组装完 Book 后跑一遍，找不到落点的把 `label` 还原回正文（不留死链接）。
    例外：`note` 段开头（偏移 0）的那条反向链接直接丢掉 —— 它是注释自己的编号，
    正文那边已有指过来的链接，留着就是注释开头的多余 `[1]`。
-3. **渲出去**：正文 `<a class="noteref" epub:type="noteref" href="chap0007.xhtml#id">[1]</a>`，
-   落点 `<p class="note" id="..." epub:type="footnote">`。`epub:type="footnote"` 是
-   阅读器判断"这是条注、该弹窗"的依据，缺了它 noteref 只是普通跳转。
-   **href 必须写对文件**：注释在别的章节里时只写 `#id` 会跳到当前章一个不存在的锚点，
-   所以渲染前先建"锚点 → 文件"表，逐文档生成相对链接（章节文件同在 `Text/`，
-   用文件名即可）。全书都找不到落点时只留文字。
+3. **渲出去（掌阅弹注）**：注文写进注标图的属性，不再排成注释段落。
+
+   ```html
+   <img class="zhangyue-footnote" src="../Images/note.png" alt="注" zy-footnote="注文"/>
+   ```
+
+   尺寸只写在样式表 `img.zhangyue-footnote` 里，标签上不挂 `style`、也不写
+   `width` / `height` 属性：几百个注标各带一份内联值，改一次要重排全文，两份值还
+   会漂。盒子不带 `padding` —— 圆牌周围那圈字面空白已经够，套一层内边距只会把图
+   缩小、把占位加宽。
+   掌阅只认这套私有标记 —— 它不认 `epub:type`，标准写法的 `<a epub:type="noteref">`
+   在它手里只是一条普通跳转。而它给的正好是这本书要的效果：注文在属性里，
+   正文里一个字都不留，不必指望阅读器去"隐藏"注释块。三条代价，选它之前都认过：
+   注标必须是图片（跟着包走的是 `huoban/assets/note.png`，见 `docs/design-assets.md`）；
+   注文只能纯文本、不分段（掌阅弹窗只显示第一段）；除掌阅系之外点了没反应。
+   另外 `zy-footnote` 不在 HTML5 属性表里，EPUBCheck 会判它不合法 —— 掌阅自家的书
+   同样如此，这不是写错了。
+
+   **注文从哪儿来**：渲之前先建全书的"锚点 → 注文"表，跨章的注释照样取得到；
+   被注码指到的注释段随之从正文里拿掉，否则同一段注文会印两遍。没有注码指到的
+   （TXT 清洗出来的按语、丢了注码的孤儿注）照旧成组排在章末 —— 藏起一段没人能
+   打开的文字等于删字。注标图读不到或 PNG 签名无效时，整条路退回旧做法（`<a class="noteref">` +
+   `<p class="note" epub:type="footnote">`），既不藏也不丢，并报一条警告。
+
+   **重排读回来**时认 `img.zhangyue-footnote[zy-footnote]`，把注文存进 `refs[].text`
+   （这类引用没有落点，文字跟着引用走）；再打包又是一张注标，回环是个不动点。
+
+   **注标写在章标题里**（`<h1>作者生平述要<img class="zhangyue-footnote" …></h1>`）
+   是另一种位置：标题块因为"与目录同名"被剔掉时，注码跟着整块消失。因此 schema v5
+   给 `Chapter` 加了 `refs`（格式同 `Paragraph.refs`，偏移相对 `title`），导入时把
+   被剔标题块上的引用存进去，打包时按同一偏移写回 `<h1>` —— 位置与源书一致。
+   标题不是段落，遍历段落的那几处（注释账、锚点清理、死链裁决）都要单独算上它：
+   `_iter_book_refs` 一并产出正文与标题的引用，`_finalize_refs` / `_drop_unreferenced_anchors`
+   也对 `Chapter.refs` 走一遍。偏移存进 JSON 前用 `model.fit_refs` 收进标题长度 ——
+   目录标题常比正文标题短（「第一章」对「第一章　劫后梦醒」），不收就会渲不出来，
+   而注文已经搬走，等于丢注。前言没有章节实体可挂，退化成把注码挪进正文第一段。
 
 **导入收尾：清理未被 `refs` 指向的 id。** Kobo / Calibre 出的书常在段落外套一层
 `<span id="kobo.12.3">`（记阅读位置用），版式容器上还可能挂着 `book-columns`。

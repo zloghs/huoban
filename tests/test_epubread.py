@@ -1524,6 +1524,58 @@ def case_marker_only_note_without_type_attr() -> None:
         # 目录式的普通链接（显示文字不是注码）不许被当成引用
         assert not any(r["label"] == "第1章" for r in refs), refs
 
+def case_note_marker_with_note_word() -> None:
+    """注码写成「（注１）」、回跳写成「注１：」时也要认成注释。
+
+    台湾角川的竖排书（实测《象首迷宫》）把注码排成
+    `<a href="#ref1-001"><span>（注１）</span></a>`，页底注文是
+    `<p id="ref1-001">　<a href="#key1-001">注１：</a>注文…</p>`。
+    这两种写法都比既有判据多出一个字或一个冒号 —— 只认「(1)」「①」「注1」
+    的话，注码退化成正文里的死文字「（注１）」，注文段没有任何注码指着，
+    整本书的脚注全留在章末当普通段落，读者看到的就是"注释没了"。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        body = XHTML.format(
+            body=(
+                '<h2 id="c1">第1章 起</h2>'
+                '<p>正文开头<a class="cyu" href="body.xhtml#ref1-001">'
+                '<span class="key1" id="key1-001">（注１）</span></a>接着写下去。</p>'
+                '<p>又一段<a class="cyu" href="body.xhtml#ref1-002">'
+                '<span class="key1" id="key1-002">（注２）</span></a>写完了。</p>'
+                '<p><a href="body.xhtml#c1">第1章</a></p>'
+                '<p id="ref1-001">　<a class="cyu" href="body.xhtml#key1-001">'
+                '<span class="key1">注１：</span></a>注文一。</p>'
+                '<p id="ref1-002">　<a class="cyu" href="body.xhtml#key1-002">'
+                '<span class="key1">注２：</span></a>注文二。</p>'
+            )
+        )
+        path = _epub(
+            tmp,
+            {
+                "OEBPS/content.opf": _opf(
+                    spine=["b"],
+                    manifest=[
+                        ("b", "Text/body.xhtml", "application/xhtml+xml", ""),
+                        ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                    ],
+                ),
+                "OEBPS/toc.ncx": _ncx(_navpoint("第1章 起", "Text/body.xhtml")),
+                "OEBPS/Text/body.xhtml": body,
+            },
+        )
+        book = read_epub(path)
+        allp = _all_paragraphs(book)
+        notes = [p for p in allp if p.kind == "note"]
+        # 注文段变成 note，开头的全角缩进与「注１：」回跳一并剥掉
+        assert [p.text for p in notes] == ["注文一。", "注文二。"], [p.text for p in allp]
+        body_paras = [p for p in allp if p.kind == "body"]
+        refs = [r for p in body_paras for r in p.refs]
+        assert [r["note"] for r in refs] == ["ref1-001", "ref1-002"], refs
+        assert [r["label"] for r in refs] == ["（注１）", "（注２）"], refs
+        # 注码不许以死文字留在正文里
+        assert "（注" not in "".join(p.text for p in allp), [p.text for p in allp]
+
 def case_note_box_container_propagates_kind() -> None:
     """注释语义写在容器上、文字在子元素里时，子段落也必须变成 note。
 
@@ -2966,6 +3018,7 @@ def main() -> int:
         case_calibre_noteref_and_rearnote,
         case_duokan_noteref_icon_keeps_ref,
         case_marker_only_note_without_type_attr,
+        case_note_marker_with_note_word,
         case_note_box_container_propagates_kind,
         case_dangling_ref_restored_to_text,
         case_note_leading_backlink_dropped,

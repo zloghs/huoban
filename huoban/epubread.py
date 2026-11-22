@@ -194,6 +194,7 @@ class _NavNode:
     children: list["_NavNode"] = field(default_factory=list)
     order: int = 0      # 先序遍历序号（位置回退时保持目录顺序）
     depth: int = 0      # 原目录深度，与标题采用的卷章排版分开保存
+    front: bool = False # 是否书前内容：自己命中前附词，或父条目已经是书前内容
 
 
 @dataclass
@@ -692,15 +693,21 @@ def _parse_nav(zf: zipfile.ZipFile, name: str, base: str, resolve, warnings: lis
 
 
 def _flatten(nodes: list[_NavNode]) -> list[_NavNode]:
-    """先序遍历，保留原目录深度并打上连续序号（位置回退与未消费统计用）。"""
+    """先序遍历，保留原目录深度并打上连续序号（位置回退与未消费统计用）。
+
+    顺便把「是否书前内容」的判定一次定死：自己命中前附词，或者父条目已经是
+    书前内容。后者不是锦上添花 ——《啸风山庄》的「导读」底下挂着作者生平述要等
+    五节，这五节一个前附词都不含，只按标题判就会从导读里漏出去。
+    """
     out: list[_NavNode] = []
 
-    def walk(items: list[_NavNode], depth: int = 0) -> None:
+    def walk(items: list[_NavNode], depth: int = 0, parent_front: bool = False) -> None:
         for node in items:
             node.order = len(out) + 1
             node.depth = depth
+            node.front = parent_front or _is_front_title(_clean_text(node.title))
             out.append(node)
-            walk(node.children, depth + 1)
+            walk(node.children, depth + 1, node.front)
 
     walk(nodes)
     return out
@@ -2251,6 +2258,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     size_cache: dict[str, tuple[int, int]] = {}
     current: list[Paragraph] = front   # 当前"续写目标"（前言或某章的段落表）
     front_volume: Chapter | None = None  # 已建的「前附（卷）」；原目录前附条目收在它下面
+    # 原目录里「前附」这条自己的深度；本工具自己合成的前附卷没有对应条目，记 -1。
+    # 收进卷里的条目按「相对前附的深度」平移，原目录的层级才不会被压平。
+    front_source_depth = -1
     chapters_started = False             # 是否已切出第一个正文条目
     front_entries = 0                    # 前附卷下的子章数（报告用）
     toc_dropped = 0        # 被当成目录页丢掉的条目数
@@ -2392,19 +2402,23 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         _emit(rest)
         return ch
 
-    def _start_front_volume(title: str, items: list[list], toc_depth: int | None) -> Chapter:
+    def _start_front_volume(
+        title: str, items: list[list], toc_depth: int | None, from_source: bool = True
+    ) -> Chapter:
         """建立「前附（卷）」，把此前积在前言里的零散段落收进卷首页。
 
         两个入口共用：原书目录里本来就写着「前附」这一卷（直接接管，不再套第二层），
         或者先遇到前附条目、卷还没建（由 _ensure_front_volume 触发）。
+        `from_source` 区分这两条路：只有接管原目录那一条才知道「前附」在原目录的深度。
         """
-        nonlocal current, front_volume
+        nonlocal current, front_volume, front_source_depth
         ch = Chapter(title=title, number=None, level=2, start_line=0, toc_depth=toc_depth)
         if front:
             ch.paragraphs.extend(front)
             front.clear()
         chapters.append(ch)
         front_volume = ch
+        front_source_depth = toc_depth if from_source and isinstance(toc_depth, int) else -1
         current = ch.paragraphs
         rest, title_refs = _drop_duplicate_heading(items, title)
         ch.refs = fit_refs(title_refs, title)
@@ -2414,20 +2428,64 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     def _ensure_front_volume() -> Chapter:
         """前附卷按需创建：只有真遇到前附条目才多出这一卷，没有前附的书结构不变。"""
         if front_volume is None:
-            _start_front_volume(_FRONT_VOLUME_TITLE, [], 0)
+            _start_front_volume(_FRONT_VOLUME_TITLE, [], 0, from_source=False)
         return front_volume
 
-    def _new_front_chapter(title: str, items: list[list]) -> Chapter:
+    def _front_depth(node_depth: int | None) -> int:
+        """前附条目收进前附卷之后该占的目录深度。
+
+        按「相对前附的深度」平移，前附卷自己的深度打底：
+        前附卷占 0 层时，它的直接子条目就是 1；原目录在这条目下面还有一层
+        （《啸风山庄》的「导读」底下挂着五节），下一层就落到 2。
+
+        不能直接把原目录深度照抄：本工具合成的「前附」在原目录里根本没有，
+        照抄会把平铺的前附条目全推到顶层；也不能一律压成 1，那会把导读
+        和它的五节压成六个平级章。
+        """
+        volume = _ensure_front_volume()
+        base = volume.toc_depth if isinstance(volume.toc_depth, int) else 0
+        if isinstance(node_depth, int):
+            offset = node_depth - front_source_depth
+        else:
+            offset = 1
+        return max(base + offset, base + 1)
+
+    def _new_front_volume(title: str, items: list[list], node_depth: int | None) -> Chapter:
+        """前附里自己带子条目的条目：建「卷」，子条目各成章挂在它底下。
+
+        判据与正文一致 —— 目录里有没有子条目说了算，不看标题关键词。《啸风山庄》
+        的「导读」在原目录里挂着作者生平述要等五节，它就该是卷；把它当章收进前附，
+        那五节会跟着变成平级章，读者在目录里看不出它们属于导读。
+        """
+        nonlocal current, front_entries
+        ch = Chapter(
+            title=title,
+            number=None,
+            level=2,
+            start_line=0,
+            toc_depth=_front_depth(node_depth),
+        )
+        chapters.append(ch)
+        current = ch.paragraphs
+        rest, title_refs = _drop_duplicate_heading(items, title)
+        ch.refs = fit_refs(title_refs, title)
+        _emit(rest)
+        front_entries += 1
+        return ch
+
+    def _new_front_chapter(
+        title: str, items: list[list], node_depth: int | None = None
+    ) -> Chapter:
         """把原目录里的一个前附条目收成前附卷的子章。
 
         标题必须留下（目录里要显示原名），正文里与它重复的那块标题仍然剔除，
-        否则同一个名字会印两遍。目录深度取卷的深度加一：卷本身就是原书给的时，
-        子章得跟着它所在的层级走，不能一律写死成 1。
+        否则同一个名字会印两遍。目录深度见 _front_depth：卷本身就是原书给的、
+        或者原目录在这条目下面还有一层时，子章得跟着走，不能一律写死成 1。
         """
         nonlocal current, front_entries
-        volume = _ensure_front_volume()
-        depth = volume.toc_depth + 1 if isinstance(volume.toc_depth, int) else 1
-        ch = Chapter(title=title, level=1, start_line=0, toc_depth=depth)
+        ch = Chapter(
+            title=title, level=1, start_line=0, toc_depth=_front_depth(node_depth)
+        )
         heading = parse_heading(title)
         ch.number = heading.number if heading is not None else None
         chapters.append(ch)
@@ -2512,8 +2570,13 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                     if _norm_key(title) == _FRONT_VOLUME_TITLE:
                         _start_front_volume(title, seg, node.depth)
                         continue
-                    if _is_front_title(title):
-                        _new_front_chapter(title, seg)
+                    if node.front:
+                        # 目录里自带子条目的是「卷」，与正文用同一条判据：结构由目录
+                        # 给，不由关键词给。不带子条目的才是前附子章。
+                        if node.children:
+                            _new_front_volume(title, seg, node.depth)
+                        else:
+                            _new_front_chapter(title, seg, node.depth)
                         continue
                 level = 2 if node.children else 1
                 _new_chapter(title, level, seg, toc_depth=node.depth)

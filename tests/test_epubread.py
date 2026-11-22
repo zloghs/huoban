@@ -2822,12 +2822,115 @@ def case_book_title_not_front_word() -> None:
         assert _is_front_title(title) is False, title
 
 
+def case_front_entry_with_children_becomes_volume() -> None:
+    """前附条目自己带子条目时就是「卷」，不能和它的子条目并排成平级章。
+
+    真实样本《啸风山庄》：原目录里「导读」是一条父条目，底下挂着作者生平述要、
+    作品的出版与接受等五节。前附条目一律按「章」收进前附卷之后，导读与这五节
+    成了六个平级章，读者在目录里看不出那五节属于导读。
+
+    结构是目录给的，不是关键词给的：有子条目就建卷，其子条目的目录深度跟着
+    下移一层；前附卷本身的位置不变。
+    """
+    entries = {
+        "OEBPS/content.opf": _opf(
+            spine=["c0", "c1", "c2", "c3", "c4", "c5"],
+            manifest=[
+                ("c0", "Text/copy.xhtml", "application/xhtml+xml", ""),
+                ("c1", "Text/guide.xhtml", "application/xhtml+xml", ""),
+                ("c2", "Text/life.xhtml", "application/xhtml+xml", ""),
+                ("c3", "Text/publish.xhtml", "application/xhtml+xml", ""),
+                ("c4", "Text/part1.xhtml", "application/xhtml+xml", ""),
+                ("c5", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        ),
+        "OEBPS/toc.ncx": _ncx(
+            _navpoint("版权信息", "Text/copy.xhtml")
+            + _navpoint(
+                "导读",
+                "Text/guide.xhtml",
+                _navpoint("作者生平述要", "Text/life.xhtml")
+                + _navpoint("作品的出版与接受", "Text/publish.xhtml"),
+            )
+            + _navpoint(
+                "第一部",
+                "Text/part1.xhtml",
+                _navpoint("第一章", "Text/ch1.xhtml"),
+            )
+        ),
+        "OEBPS/Text/copy.xhtml": XHTML.format(
+            body="<h1>版权信息</h1><p>书名：测试书</p>"
+        ),
+        "OEBPS/Text/guide.xhtml": XHTML.format(
+            body="<h1>导读</h1><p>本篇导读分为五节。</p>"
+        ),
+        "OEBPS/Text/life.xhtml": XHTML.format(
+            body="<h1>作者生平述要</h1><p>她是三姐妹之一。</p>"
+        ),
+        "OEBPS/Text/publish.xhtml": XHTML.format(
+            body="<h1>作品的出版与接受</h1><p>初版并不顺利。</p>"
+        ),
+        "OEBPS/Text/part1.xhtml": XHTML.format(body="<h1>第一部</h1>"),
+        "OEBPS/Text/ch1.xhtml": XHTML.format(
+            body="<h1>第一章</h1><p>正文第一段。</p>"
+        ),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        imp = read_epub_with_report(_epub(Path(td), entries))
+
+    chapters = imp.book.chapters
+    assert [ch.title for ch in chapters] == [
+        "前附",
+        "版权信息",
+        "导读",
+        "作者生平述要",
+        "作品的出版与接受",
+        "第一部",
+        "第一章",
+    ], [ch.title for ch in chapters]
+    guide = chapters[2]
+    assert guide.level == 2, (guide.title, guide.level)
+    assert guide.toc_depth == 1, (guide.title, guide.toc_depth)
+    # 导读自己的引言留在卷首页，子条目的正文各归自己
+    assert [p.text for p in guide.paragraphs] == ["本篇导读分为五节。"], guide.paragraphs
+    assert chapters[3].paragraphs[0].text == "她是三姐妹之一。"
+    assert [ch.toc_depth for ch in chapters[3:5]] == [2, 2], [
+        (ch.title, ch.toc_depth) for ch in chapters[3:5]
+    ]
+    # 正文的卷不受影响：第一部仍在顶层，第一章在它底下
+    assert (chapters[5].level, chapters[5].toc_depth) == (2, 0)
+    assert (chapters[6].level, chapters[6].toc_depth) == (1, 1)
+
+    # 打包后目录里，那五节要真的排在导读底下，而不是与它并列
+    book = from_dict(json.loads(json.dumps(to_dict(imp.book))))
+    data = build_epub(book, modified=FIXED_MODIFIED).data
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        nav = zf.read("OEBPS/nav.xhtml").decode("utf-8")
+    root = ET.fromstring(nav)
+    ns = {"x": "http://www.w3.org/1999/xhtml"}
+    top = root.find(".//x:nav/x:ol", ns)
+    labels = ["".join(li.find("x:a", ns).itertext()) for li in top.findall("x:li", ns)]
+    assert labels == ["前附", "第一部"], labels
+    front = top.findall("x:li", ns)[0]
+    front_labels = [
+        "".join(li.find("x:a", ns).itertext()) for li in front.findall("x:ol/x:li", ns)
+    ]
+    assert front_labels == ["版权信息", "导读"], front_labels
+    guide_li = front.findall("x:ol/x:li", ns)[1]
+    guide_kids = [
+        "".join(li.find("x:a", ns).itertext()) for li in guide_li.findall("x:ol/x:li", ns)
+    ]
+    assert guide_kids == ["作者生平述要", "作品的出版与接受"], guide_kids
+
+
 def main() -> int:
     cases = [
         case_epub2_basic_split,
         case_front_entries_keep_titles_and_chapter_boundaries,
         case_cover_page_dropped_like_toc,
         case_book_title_not_front_word,
+        case_front_entry_with_children_becomes_volume,
         case_leading_body_title_echo_is_dropped,
         case_epub3_nav_parse,
         case_multi_anchor_split,

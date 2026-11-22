@@ -1737,6 +1737,28 @@ def _is_toc_title(title: str) -> bool:
     return bool(key) and (key in _TOC_WORDS or (key.startswith("目录") and len(key) <= 4))
 
 
+# 重复封面页的关键词：这些页面跟目录页同一条路，整页丢弃。封面图由打包器重做，
+# 版权页已经写着书名与作者，再排一页只是重复。
+# 「封面」是最直白的写法，不少书的导航里就这么一条，比「书封」更常见；
+# 三个词同权，不单独给「封面」另开判据。
+_COVER_PAGE_WORDS = ("书名", "书封", "封面")
+
+
+def _is_cover_page(title: str) -> bool:
+    """这一页是不是封面/书名页的重复页（与目录页同一条路：整页丢弃）？
+
+    封面图由打包器重做，版权页已经写着书名与作者，再排一页只有这两行或一张
+    封面图，读者翻过去只觉得重复 —— 实测《谁的问题》的「书名页」、
+    《象首迷宫》目录里的「书封」都是这种页。
+
+    判据与 `_is_toc_title` 同一口径：`_norm_key` 去掉空白后"含"关键词，所以
+    「书名页」「书名：…」「书封」「封面」都算。「版权信息」不含这三个词，
+    照旧留在书前 —— 那一页里的「书名：…」是版权信息的一部分，不动。
+    """
+    key = _norm_key(title).lower()
+    return any(word in key for word in _COVER_PAGE_WORDS)
+
+
 def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list[int]:
     """算出每个目录节点在 items 里的起始下标（单调不减）。
 
@@ -2172,6 +2194,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     chapters_started = False
     front_entries = 0      # 被归进前言的目录条目数（版权/序/制作说明…）
     toc_dropped = 0        # 被当成目录页丢掉的条目数
+    cover_pages_dropped = 0 # 被当成重复封面页丢掉的条目数（与目录页同一条路）
     continuation_docs = 0  # 目录里没有、续接到当前章节的文档数
     generated_pages = 0    # 自家信息页（打包器写的元数据页），整页跳过
     back_file = ""         # 封底图落盘文件名（空串 = 没捞到）
@@ -2371,6 +2394,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 if _is_toc_title(title):
                     toc_dropped += 1
                     continue  # 目录页：丢弃
+                if _is_cover_page(title):
+                    cover_pages_dropped += 1
+                    continue  # 封面/书名页：与目录页同一条路，整页丢弃
                 if not chapters_started and _is_front_title(title):
                     # 前缀位置的"序/版权/制作说明"归前言：不建章节。
                     # 前言不是 Chapter，存不下标题注，注码只能挪进正文。
@@ -2481,6 +2507,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         "merged_pieces": pieces,
         "front_matter_entries": front_entries,
         "toc_dropped": toc_dropped,
+        # 与 toc_dropped 同一条路（整页丢弃）的重复封面页条目数：封面图由打包器
+        # 重做，版权页已经写着书名与作者，再排一页只是重复。
+        "cover_pages_dropped": cover_pages_dropped,
         # 清掉的章末「注释：」小标题条数（注文进了弹注，标题没有下文）。
         "note_headings_dropped": note_headings_dropped,
         # 原书带来、但未被保留 refs 指向的 id 条数（Kobo 的 kobo.*、容器 id）。

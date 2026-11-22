@@ -374,6 +374,7 @@ def _print_reflow_summary(
     print(
         f"      前言 {report['front_matter_paragraphs']} 段"
         f"（前附条目 {report['front_matter_entries']}，跳过目录页 {report['toc_dropped']}、"
+        f"重复封面页 {report['cover_pages_dropped']}，"
         f"删注释标题 {report['note_headings_dropped']} 行，"
         f"续页 {report['continuation_docs']}）",
         file=out,
@@ -792,6 +793,7 @@ def main(argv: list[str] | None = None) -> int:
                     "merged_groups": report["merged_groups"],
                     "merged_pieces": report["merged_pieces"],
                     "front_matter_paragraphs": report["front_matter_paragraphs"],
+                    "cover_pages_dropped": report["cover_pages_dropped"],
                     "note_headings_dropped": report["note_headings_dropped"],
                     "ids_dropped": report["ids_dropped"],
                     "images_kept": report["images_kept"],
@@ -814,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
                     "merged_groups": report["merged_groups"],
                     "merged_pieces": report["merged_pieces"],
                     "front_matter_paragraphs": report["front_matter_paragraphs"],
+                    "cover_pages_dropped": report["cover_pages_dropped"],
                     "note_headings_dropped": report["note_headings_dropped"],
                     "ids_dropped": report["ids_dropped"],
                     "images_kept": report["images_kept"],

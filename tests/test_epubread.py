@@ -1582,6 +1582,74 @@ def case_note_heading_dropped() -> None:
         ], [p.text for p in second.paragraphs]
 
 
+def case_cover_page_dropped_like_toc() -> None:
+    """封面重复页跟目录页走同一条路：整页丢弃，不占章节、也不进书前内容。
+
+    三类页都在这里：《谁的问题》的「书名页」—— 封面与版权页已经写着书名与
+    作者，再排一页只有这两行；《象首迷宫》目录里的「书封」—— 整页只有一张
+    封面图，而封面图由打包器重做；导航里直接叫「封面」的页面 —— 同一件事的
+    最常见写法。判据与目录页同一口径：去掉空白后含关键词，「书名页」
+    「书名：…」「书封」「封面」都算。
+
+    作者名不许跟着这一页一起丢：它来自 OPF 的 dc:creator，不是正文。
+    """
+    docs = [
+        ("书封", "cover"),
+        ("封面", "cv"),
+        ("书名页", "name"),
+        ("版权信息", "copy"),
+        ("第一章 开端", "ch1"),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        entries = {
+            "OEBPS/content.opf": _opf(
+                spine=[k for _, k in docs],
+                manifest=[
+                    (k, f"Text/{k}.xhtml", "application/xhtml+xml", "") for _, k in docs
+                ]
+                + [("ncx", "toc.ncx", "application/x-dtbncx+xml", "")],
+            ),
+            "OEBPS/toc.ncx": _ncx(
+                "".join(_navpoint(t, f"Text/{k}.xhtml") for t, k in docs)
+            ),
+            "OEBPS/Text/cover.xhtml": XHTML.format(
+                body="<h1>书封</h1><p>封面式样</p>"
+            ),
+            "OEBPS/Text/cv.xhtml": XHTML.format(
+                body="<h1>封面</h1><p>一张图占满整页</p>"
+            ),
+            "OEBPS/Text/name.xhtml": XHTML.format(
+                body="<h1>书名页</h1><p>测试书</p><p>某作者</p>"
+            ),
+            "OEBPS/Text/copy.xhtml": XHTML.format(
+                body="<h1>版权信息</h1><p>书名：测试书</p><p>出版社：某社</p>"
+            ),
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body="<h1>第一章 开端</h1><p>正文第一段。</p>"
+            ),
+        }
+        imp = read_epub_with_report(_epub(tmp, entries))
+
+    book = imp.book
+    assert [ch.title for ch in book.chapters] == ["第一章 开端"], [
+        ch.title for ch in book.chapters
+    ]
+    # 三页都整页不在了：标题与页里那几段一个都不许漏进别的段
+    texts = [p.text for p in _all_paragraphs(book)]
+    assert "书封" not in texts, texts
+    assert "封面式样" not in texts, texts
+    assert "封面" not in texts, texts
+    assert "一张图占满整页" not in texts, texts
+    assert "书名页" not in texts, texts
+    assert "测试书" not in texts, texts
+    assert "某作者" not in texts, texts
+    # 版权页自己的「书名：…」是版权信息的一部分，照旧保留
+    assert "书名：测试书" in texts, texts
+    assert imp.report["cover_pages_dropped"] == 3, imp.report
+    assert book.author == "某作者", book.author
+
+
 def case_generated_info_page_skipped() -> None:
     """自家信息页整页跳过；别人的普通"无目录页"仍按续页/前言保留。"""
     with tempfile.TemporaryDirectory() as td:
@@ -2516,6 +2584,7 @@ def main() -> int:
         case_dangling_ref_restored_to_text,
         case_note_leading_backlink_dropped,
         case_note_heading_dropped,
+        case_cover_page_dropped_like_toc,
         case_generated_info_page_skipped,
         case_back_cover_page_skipped,
         case_back_cover_guide_fallback,

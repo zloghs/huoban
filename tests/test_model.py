@@ -375,10 +375,10 @@ def case_version_guard() -> None:
     只多一个 rows（table 段专用），v4 增加 refs[].text，v5 增加 Chapter.refs，
     v6 增加可选目录深度。旧文件按新版本读入都无损；其余主版本仍然拒绝。
     """
-    for good in ("1", "2", "3", "4", "5", "6", "6.0", "1.5.9-rc"):
+    for good in ("1", "2", "3", "4", "5", "6", "7", "7.0", "1.5.9-rc"):
         ok = from_dict({"version": good, "chapters": []})
         assert isinstance(ok, Book), good
-    for bad in ("0", "7", "9.0"):
+    for bad in ("0", "8", "9.0"):
         try:
             from_dict({"version": bad, "chapters": []})
         except ValueError:

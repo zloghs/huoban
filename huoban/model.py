@@ -53,7 +53,10 @@ from .diagnose import cn_to_int, match_chapter, strip_frame
 # v5 → v6（原目录层级）：Chapter 新增可选 toc_depth，记原 EPUB 的目录深度。
 # 同样**纯增量**：旧树没有这个键，读入后是 None，仍按 level 推断卷章关系，
 # 重新序列化也不写它。
-SCHEMA_VERSION = "6"
+#
+# v6 → v7（保留注音）：Paragraph 新增 ruby 字段，装段内的注音区间。
+# 同样**纯增量**：旧树没有这个键，读入后是空列表，重新序列化也不写它。
+SCHEMA_VERSION = "7"
 
 # 段落类型。渲染层按这个决定排版，清洗层按这个标注，两边共用同一份取值。
 # verse = 诗词/韵文（词曰、诗云、右调·XXX 之类）：本质是"引文"，
@@ -104,6 +107,15 @@ class Paragraph:
     # 清洗 TXT 那条线永远不写这两个字段，to_dict 也只在非空时才写。
     anchor: str = ""
     refs: list[dict] = field(default_factory=list)
+    # 段内的**注音**（schema v7，EPUB 导入专用）：每条
+    # `{"at": 起点偏移, "len": 被注音的字数, "rt": 注音文字}`。
+    # 覆盖 text[at : at+len]，`rt` 是原书 `<rt>` 里的读音（罗马字/假名/拼音）。
+    # 为什么单独存一列而不是拼进 text：注音不是正文，拼进去会让「梦泽文哉」
+    # 变成「梦泽文AYA哉KA」，检索、字数、朗读全被污染；可它又确实是信息
+    # （人名怎么念、代号原文是哪个英文词），不能一声不响扔掉。
+    # 清洗 TXT 那条线永远不写这个字段（TXT 表达不了行内注音），
+    # to_dict 也只在非空时才写。
+    ruby: list[dict] = field(default_factory=list)
     # 以下字段只在 kind == "table" 时有意义（schema v3，EPUB 导入专用）：
     # 整张表的二维网格，rows[行][列] = 一个单元格 dict：
     #   {"text": 文字, "header": 是不是表头格（<th>）,
@@ -351,6 +363,44 @@ def _normalize_refs(raw) -> list[dict]:
     return out
 
 
+def _normalize_ruby(raw) -> list[dict]:
+    """把 JSON 里的 ruby 归一成 `[{"at", "len", "rt"}]`。
+
+    三条约束都在这一处收敛，渲染层不必再做防御：
+    - `len` 必须 > 0（零长度的注音没有可覆盖的字，渲出来只能是一对空标签）；
+    - `rt` 不能是空串（没有读音就没什么可注的）；
+    - 区间按 `at` 升序且**互不重叠**（`<ruby>` 在 HTML 里本身不允许嵌套，
+      手改 JSON 改出重叠时保留靠前的一条，后面的丢掉）。
+
+    越界（`at` 或 `at+len` 超出 text）这里判不了 —— 归一发生在读文件时，
+    还没跟 `text` 对上号。渲染层按 text 长度再判一次（见 epub.py 的
+    `_ruby_spans`），跳过的条目不会把注音渲到错的地方。
+    """
+    out: list[dict] = []
+    last_end = -1
+    # 先排序再去重叠：输入顺序是文件里写的，手改 JSON 很容易把两条写反。
+    # 边读边判会把"排在前面的那条 at 更大"当成重叠，白丢一条。
+    candidates = sorted(
+        (
+            {"at": _as_int(r.get("at"), -1), "len": _as_int(r.get("len"), 0), "rt": str(r["rt"])}
+            for r in _as_list(raw)
+            if isinstance(r, dict) and r.get("rt") is not None and str(r["rt"]).strip()
+        ),
+        key=lambda x: x["at"],
+    )
+    for item in candidates:
+        if item["at"] < 0 or item["len"] <= 0 or item["at"] < last_end:
+            continue
+        out.append(item)
+        last_end = item["at"] + item["len"]
+    return out
+
+
+def _ruby_to_dict(item: dict) -> dict:
+    """ruby 的一条落盘形态。键序固定，老树不产生这个键。"""
+    return {"at": item["at"], "len": item["len"], "rt": item["rt"]}
+
+
 def fit_refs(refs, text: str) -> list[dict]:
     """把行内引用的偏移收进 `text` 的长度之内，返回新列表。
 
@@ -483,6 +533,9 @@ def _paragraph_to_dict(p: Paragraph) -> dict:
         d["anchor"] = p.anchor
     if p.refs:
         d["refs"] = [_ref_to_dict(r) for r in p.refs]
+    # 注音同理：只在这段真有注音时写，老树重新序列化后逐字节不变。
+    if p.ruby:
+        d["ruby"] = [_ruby_to_dict(r) for r in p.ruby]
     return d
 
 
@@ -506,6 +559,7 @@ def _paragraph_from_dict(raw) -> Paragraph:
         anchor="" if anchor is None else str(anchor),
         refs=_normalize_refs(raw.get("refs")),
         rows=normalize_rows(raw.get("rows")),
+        ruby=_normalize_ruby(raw.get("ruby")),
     )
 
 
@@ -615,7 +669,9 @@ def from_dict(d: dict) -> Book:
     major = version.split(".")[0].strip()
     # 历次 schema 升级只增加可选字段，旧文件按新版本读入都无损；其余版本仍然拒绝，
     # 宁可当场报错，也不按不认识的语义读出一本结构错位的书。
-    if major not in ("1", "2", "3", "4", "5", "6"):
+    # 支持范围从 SCHEMA_VERSION 派生：以前这里写死一个元组，升版本时忘了同步
+    # 就会出现"自己刚写出来的文件自己读不进去"（本次 v7 就踩了一次）。
+    if major not in {str(n) for n in range(1, int(SCHEMA_VERSION.split(".")[0]) + 1)}:
         raise ValueError(
             f"不认识的章节树版本 {version!r}（当前支持 1 至 {SCHEMA_VERSION}）："
             "字段含义可能已变，拒绝按旧语义读出错误的章节结构"

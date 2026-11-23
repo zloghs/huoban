@@ -1146,6 +1146,76 @@ def _flatten_kinds(book: Book) -> list[str]:
     return kinds
 
 
+def case_ruby_kept_as_inline_note() -> None:
+    """注音不是正文：`<ruby>文<rt>AYA</rt></ruby>` 读成「文」+ 一条注音。
+
+    错在把 rt 收进正文缓冲，一段话会变成「梦泽文AYA哉KA」——检索、字数、
+    朗读全被污染。同时 `<rp>(</rp>` 那对兜底括号也不能留（真书里会变成
+    「文（AYA）」）。注音本身不能丢：人名读音、代号原文都是信息。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = _epub(
+            tmp,
+            {
+                "OEBPS/content.opf": _opf(
+                    spine=["c1"],
+                    manifest=[
+                        ("c1", "Text/c1.xhtml", "application/xhtml+xml", ""),
+                        ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                    ],
+                ),
+                "OEBPS/toc.ncx": _ncx(_navpoint("第一章", "Text/c1.xhtml")),
+                "OEBPS/Text/c1.xhtml": XHTML.format(
+                    body="<h1>第一章</h1>"
+                    "<p>梦泽<ruby>文<rt>AYA</rt></ruby><ruby>哉<rt>KA</rt></ruby>。</p>"
+                    "<p>和泉<ruby>早希<rp>(</rp><rt>SAKI</rt><rp>)</rp></ruby>来了。</p>"
+                    "<table><tr><td>伊豆<ruby>美崎<rt>MISAKI</rt></ruby></td></tr></table>"
+                ),
+            },
+        )
+        paras = read_epub(path).chapters[0].paragraphs
+        assert paras[0].text == "梦泽文哉。", paras[0].text
+        assert paras[0].ruby == [
+            {"at": 2, "len": 1, "rt": "AYA"},
+            {"at": 3, "len": 1, "rt": "KA"},
+        ], paras[0].ruby
+        # rp 是"不支持 ruby 的阅读器"看到的括号，不该进正文，也不该算进 base。
+        assert paras[1].text == "和泉早希来了。", paras[1].text
+        assert paras[1].ruby == [{"at": 2, "len": 2, "rt": "SAKI"}], paras[1].ruby
+        # 表格没有注音这一列：读音丢掉，但 base 必须留、不能把 rt 混进格子
+        # （`<ruby>` 分支排在表格分支之后时，格子会变成「伊豆MISAKI美崎」）。
+        assert paras[2].kind == "table", paras[2].kind
+        assert paras[2].rows[0][0]["text"] == "伊豆美崎", paras[2].rows[0][0]["text"]
+
+
+def case_ruby_roundtrip_keeps_note() -> None:
+    """注音过一遍打包不能再退化：build_epub 渲 `<ruby>`，read_epub 原样读回。
+
+    回环是项目契约。少了这条，重排一次注音就变成正文里的裸字母，而重排
+    两次的产物与一次不同 —— 不动点当场破掉。
+    """
+    book = Book(
+        title="注音回环",
+        author="假作者",
+        source="X:/假/注音回环.txt",
+        chapters=[
+            Chapter(
+                title="第一章 假章",
+                number=1,
+                paragraphs=[Paragraph(text="梦泽文哉。", ruby=[{"at": 2, "len": 2, "rt": "FUMIYA"}])],
+            )
+        ],
+    )
+    with tempfile.TemporaryDirectory() as td:
+        built = build_epub(book, modified=FIXED_MODIFIED)
+        path = Path(td) / "ruby.epub"
+        path.write_bytes(built.data)
+        para = read_epub(path).chapters[0].paragraphs[0]
+    assert para.text == "梦泽文哉。", para.text
+    assert para.ruby == [{"at": 2, "len": 2, "rt": "FUMIYA"}], para.ruby
+
+
 def case_self_roundtrip_kinds() -> None:
     """自家产物回环：build_epub → read_epub，段落 kind 序列与图说必须一字不差。
 
@@ -3008,6 +3078,8 @@ def main() -> int:
         case_table_structure_kept,
         case_drop_unreferenced_anchors,
         case_table_caption_and_empty_rows,
+        case_ruby_kept_as_inline_note,
+        case_ruby_roundtrip_keeps_note,
         case_table_roundtrip,
         case_zhangyue_footnote_roundtrip,
         case_same_fragment_name_in_two_chapters,

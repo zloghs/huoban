@@ -6,7 +6,9 @@
 
 设计边界（docs/gui-design.md 的「EPUB 导入」一节）：
 - **重排，不是转换**：走章节树重新决定每段是什么（正文/标题/图说/脚注），
-  字符级格式（加粗、斜体、ruby 注音、字号）一律丢弃；
+  字符级格式（加粗、斜体、字号）一律丢弃；**注音（ruby）是例外** —— 它算信息不算
+  格式（人名怎么念、代号原文是哪个英文词），收进 `Paragraph.ruby`，打包时还原成
+  `<ruby>`，TXT 输出只留 base；
 - **章节边界以 NCX/nav 为准**，不信正文里的大字标题 —— 盗版书的"标题"
   经常是整段加粗正文；
 - **图片落盘不落内存**：一本 54 张图的画册全塞进内存再写盘，峰值会翻倍；
@@ -239,6 +241,18 @@ def _norm_key(text: str) -> str:
 # （\x01 和 \x02 都不属于它压缩的空白字符集），清洗完再按哨兵的真实位置
 # 反算偏移，才不会把链接插到错的地方。
 _REF_SENTINEL = re.compile("\x01(\\d+)\x02")
+
+# 注音（`<ruby>文<rt>AYA</rt></ruby>`）的 base 也用哨兵标位：起点 \x03N\x04、
+# 终点 \x05N\x06。理由与行内引用完全相同 —— `_clean_text` 会压空白、去零宽、
+# strip 首尾，解析期记下的字符偏移到那时候已经不可信；而且 base 的长度只有
+# 两个哨兵之间的文字定下来才知道（「和泉早希」是 4 个字，「文」是 1 个）。
+# 两个哨兵一起被扫掉时，cur 已经是"干净文字"的下标，at/len 直接可用。
+_RUBY_START = "\x03%d\x04"
+_RUBY_END = "\x05%d\x06"
+# 三种哨兵一次扫完：先删引用哨兵再删注音哨兵会让后者的偏移把前者的字符算进去。
+# 上面那条 `_REF_SENTINEL` 留作引用哨兵的形状说明（本文件已不再单独用它扫描，
+# 三种标记统一走这条合并正则）。
+_INLINE_SENTINEL = re.compile("\x01(\\d+)\x02|\x03(\\d+)\x04|\x05(\\d+)\x06")
 
 
 def _ext_from_magic(data: bytes) -> str | None:
@@ -898,6 +912,15 @@ class _DocParser(html.parser.HTMLParser):
         # 正在收集的注释引用：{"frag": 目标 id, "buf": [显示文字]}
         self._ref: dict | None = None
         self._ref_seq = 0
+        # 注音：`<ruby>文<rt>AYA</rt></ruby>`。base 用哨兵标位（见 _RUBY_START），
+        # 读音收在 _rt_buf 里、不进正文缓冲。`ruby` 是本篇的 seq → 读音表，
+        # 整篇解析完由 _resolve_refs 一起定位成 at/len。
+        self._ruby: dict[int, str] = {}
+        self._ruby_seq = 0
+        # 还没闭合的 <ruby>：每层 {"seq": n, "closed_base": bool}
+        self._ruby_stack: list[dict] = []
+        self._rt_buf: list[str] | None = None  # 非 None = 正在收 <rt> 里的字
+        self._rp_depth = 0  # <rp>(</rp> 那对括号是给不支持 ruby 的阅读器看的
         # 正在收集的表格（不在表格里时是 None）。结构见 _tbl_begin。
         self._tbl: dict | None = None
 
@@ -923,6 +946,13 @@ class _DocParser(html.parser.HTMLParser):
     def _append(self, data: str) -> None:
         if self._skip is not None or not data:
             return
+        if self._rt_buf is not None:
+            # <rt> 里的读音不是正文：它要跟着注音区间走，混进正文就成了
+            # 「梦泽文AYA哉KA」。收在单独的缓冲里，<ruby> 闭合时落进 _ruby。
+            self._rt_buf.append(data)
+            return
+        if self._rp_depth:
+            return  # <rp>(</rp>：给不支持 ruby 的阅读器兜底的括号，不要
         if self._ref is not None:
             # 注释引用的显示文字（"[1]"）单独收，不混进正文缓冲 ——
             # 它要以链接的形式回到原位，直接写进正文就成了死文字。
@@ -935,6 +965,22 @@ class _DocParser(html.parser.HTMLParser):
             self._frames[-1][2].append(data)
         else:
             self._body_buf.append(data)
+
+    def _flush_rt(self) -> None:
+        """把正在收的 `<rt>` 落地：读音存进 `_ruby`，缓冲清空。
+
+        归一用 `_clean_text`（压空白、去零宽、strip）：注音是"词"不是段落，
+        前后不该带空白。落不到任何一个 `<ruby>` 里就丢弃 —— 没有 base 的
+        读音无处可说。
+        """
+        if self._rt_buf is None:
+            return
+        text = _clean_text("".join(self._rt_buf))
+        self._rt_buf = None
+        if not text or not self._ruby_stack:
+            return
+        seq = self._ruby_stack[-1]["seq"]
+        self._ruby.setdefault(seq, text)
 
     def _append_raw(self, data: str) -> None:
         """把哨兵写进当前缓冲，绕开引用收集（哨兵不是正文）。"""
@@ -1238,6 +1284,34 @@ class _DocParser(html.parser.HTMLParser):
                 if aid and not self._pending_anchor:
                     self._pending_anchor = aid
                 return
+        # 注音必须排在表格分支之前：表格里的 <ruby>/<rt> 若不在这里认领，
+        # 会被 _tbl_tag_start 当陌标签忽略，rt 的文字随后当正文写进格子
+        # （实测「梦泽文哉」变成「梦泽ZAWA文哉」）。
+        if tag == "ruby":
+            # base 起点插哨兵，读音在 <rt> 里单独收（见 _append）。表格里不插
+            # 哨兵 —— 单元格没有注音这一列，只留 base 文字。
+            self._ruby_seq += 1
+            seq = self._ruby_seq
+            if self._tbl is None:
+                self._append_raw(_RUBY_START % seq)
+            self._ruby_stack.append({"seq": seq, "closed_base": False})
+            return
+        if tag in ("rt", "rtc"):
+            # <rt> 开始 = base 结束：在这里插终点哨兵，中间的字符数就是 base
+            # 的长度。rtc 是 EPUB3 的写法（一个 ruby 里可以有多组 rt）。
+            if self._ruby_stack:
+                frame = self._ruby_stack[-1]
+                if not frame["closed_base"]:
+                    if self._tbl is None:
+                        self._append_raw(_RUBY_END % frame["seq"])
+                    frame["closed_base"] = True
+                self._rt_buf = []
+            return
+        if tag == "rp":
+            # <rp>(</rp><rt>……</rt><rp>)</rp>：括号是给不支持 ruby 的阅读器
+            # 看的兜底。真留下来会变成「文（AYA）」这种括号串。
+            self._rp_depth += 1
+            return
         # 表格要整张收成一个结构化项，不能按块级标签一格一段地拆（见 _tbl_begin）。
         # 这一分支必须排在"块级标签"之前：table / tr / td 在白名单里出现过
         # 一半（td/th 有、table/tr 没有），照旧走过去的结果就是每个单元格
@@ -1275,6 +1349,9 @@ class _DocParser(html.parser.HTMLParser):
             self._append(" ")
             return
         if tag in _BLOCK_TAGS:
+            # 块开始还没闭合的 <rt> 一律就地收尾：脏文档里漏一个 </rt>，
+            # 后面整章的正文都会被当成读音收走（正文一个字不剩）。
+            self._flush_rt()
             self._flush_body()
             if self._frames:
                 self._frames[-1][3] = True
@@ -1294,6 +1371,18 @@ class _DocParser(html.parser.HTMLParser):
                 self._skip[1] -= 1
                 if self._skip[1] <= 0:
                     self._skip = None
+            return
+        if tag in ("rt", "rtc"):
+            self._flush_rt()
+            return
+        if tag == "rp":
+            if self._rp_depth:
+                self._rp_depth -= 1
+            return
+        if tag == "ruby":
+            self._flush_rt()
+            if self._ruby_stack:
+                self._ruby_stack.pop()
             return
         if tag == "a" and self._ref is not None:
             label = _clean_text("".join(self._ref["buf"]))
@@ -1375,48 +1464,100 @@ class _DocParser(html.parser.HTMLParser):
         self._flush_body()
 
 
-def _resolve_sentinels(text: str, raw_refs: list, drop_leading: bool) -> tuple[str, list[dict]]:
-    """把一段文字里的哨兵换成真实偏移，返回 (去掉哨兵的文字, 引用清单)。
+def _resolve_inline(
+    text: str, raw_refs: list, raw_ruby: dict | None, drop_leading: bool
+) -> tuple[str, list[dict], list[dict]]:
+    """把一段文字里的两种哨兵换掉，返回 (干净文字, 引用清单, 注音清单)。
+
+    **三种哨兵必须一趟扫完**：先删引用哨兵再算注音偏移，注音的 at 会把已经
+    删掉的引用哨兵字符算进去（反之亦然），两种标记必然有一边错位。
 
     drop_leading=True 时丢掉落在第 0 字的引用：那是注释段开头指回正文的
     反向链接，留着会在注释开头多印一个"〔1〕"。
 
+    注音的 base 长度由「起点哨兵到终点哨兵之间还剩几个干净字符」决定，
+    所以 `at`/`len` 天然是清洗后的坐标，不用另做换算。
+
     段落与表格单元格共用本函数 —— 单元格里的偏移相对那一格，段落里的相对
     整段，两边的算法必须是同一份，否则总有一边插错位置。
     """
-    if "\x01" not in text:
-        return text, []
-    by_seq = {seq: (frag, label, own) for seq, frag, label, own in raw_refs}
     pieces: list[str] = []
     kept: list[dict] = []
+    ruby: list[dict] = []
+    if "\x01" not in text and "\x03" not in text:
+        return text, kept, ruby
+    by_seq = {seq: (frag, label, own) for seq, frag, label, own in raw_refs}
+    rt_of = raw_ruby or {}
+    opened: dict[int, int] = {}  # 注音起点：seq → 干净文字里的下标
     pos = 0
     cur = 0
-    for m in _REF_SENTINEL.finditer(text):
+    for m in _INLINE_SENTINEL.finditer(text):
         chunk = text[pos:m.start()]
         pieces.append(chunk)
         cur += len(chunk)
-        info = by_seq.get(int(m.group(1)))
-        if info is None:
-            pass  # 找不到对应记录（不该发生）：哨兵直接消失
-        elif drop_leading and cur == 0:
-            # 注释段开头那个 "[1]" 是"回到正文"的反向链接（几乎总是跨
-            # 文件，本篇里没有落点）。还原成文字只会变成注释开头的
-            # 多余编号 —— 正文那边已经有指过来的链接了，这里直接丢掉。
-            # 这条判断必须排在"目标存在就保留"之前：反向链接指向的是
-            # 正文里的锚点，全书锚点表里通常真能找到它。
-            pass
-        else:
-            # 目标不在本文档也先留着：Calibre 这类书把正文和注释
-            # 分成两个 xhtml 文件，注释的落点在别的文件里。真正的
-            # 有效性由全书锚点表在 _finalize_refs 里统一裁决。
-            if info[2]:
-                # 自带注文（掌阅注标）：没有落点可指，文字跟着这条引用走
-                kept.append({"at": cur, "note": "", "label": info[1], "text": info[2]})
+        ref_seq, ruby_start, ruby_end = m.groups()
+        if ref_seq is not None:
+            info = by_seq.get(int(ref_seq))
+            if info is None:
+                pass  # 找不到对应记录（不该发生）：哨兵直接消失
+            elif drop_leading and cur == 0:
+                pass
+                # 注释段开头那个 "[1]" 是"回到正文"的反向链接（几乎总是跨
+                # 文件，本篇里没有落点）。还原成文字只会变成注释开头的
+                # 多余编号 —— 正文那边已经有指过来的链接了，这里直接丢掉。
+                # 这条判断必须排在"目标存在就保留"之前：反向链接指向的是
+                # 正文里的锚点，全书锚点表里通常真能找到它。
             else:
-                kept.append({"at": cur, "note": info[0], "label": info[1]})
+                # 目标不在本文档也先留着：Calibre 这类书把正文和注释
+                # 分成两个 xhtml 文件，注释的落点在别的文件里。真正的
+                # 有效性由全书锚点表在 _finalize_refs 里统一裁决。
+                if info[2]:
+                    # 自带注文（掌阅注标）：没有落点可指，文字跟着这条引用走
+                    kept.append({"at": cur, "note": "", "label": info[1], "text": info[2]})
+                else:
+                    kept.append({"at": cur, "note": info[0], "label": info[1]})
+        elif ruby_start is not None:
+            opened[int(ruby_start)] = cur
+        else:
+            seq = int(ruby_end)
+            start = opened.pop(seq, None)
+            rt = rt_of.get(seq, "")
+            # 空 base（<ruby><rt>x</rt></ruby>）无处可注；没有 rt 的 ruby
+            # 只是普通文字，别在正文里留一对空标签。
+            if start is not None and rt and cur > start:
+                ruby.append({"at": start, "len": cur - start, "rt": rt})
         pos = m.end()
     pieces.append(text[pos:])
-    return "".join(pieces), kept
+    return "".join(pieces), kept, ruby
+
+
+def _resolve_refs(items: list[list], ruby_of_doc: dict | None = None) -> None:
+    """把哨兵定位成真实字符偏移，记下每条引用的落点与段内的注音。
+
+    分两趟的原因：解析一个块的时候还不知道整篇有哪些 id（注释块可能排在
+    引用之后），所以先记哨兵、整篇解析完再定。
+
+    本文档里有落点的引用直接定下来；没有落点的**先保留**（note 段开头的
+    反向链接除外 —— 那是注释自己的编号，正文那边已经有指过来的链接了）。
+    跨文件的落点要靠全书锚点表才能判，见 _finalize_refs。
+
+    表格走另一条：格内的哨兵收在 cell["text"] 里、引用收在 cell["refs"] 里，
+    跟段落的 item[1]/item[3] 不是同一处。格内的注音**只留 base 不留读音**
+    —— 单元格没有 ruby 这一列，硬塞会把读音混进格子文字。
+    """
+    for item in items:
+        if item[0] == "text":
+            while len(item) < 5:
+                item.append([])
+            item[1], item[3], item[4] = _resolve_inline(
+                item[1], item[3], ruby_of_doc, item[2] == "note"
+            )
+        elif item[0] == "table":
+            for row in item[1]:
+                for cell in row:
+                    cell["text"], cell["refs"], _ = _resolve_inline(
+                        cell["text"], cell["refs"], None, False
+                    )
 
 
 def _iter_cells(para):
@@ -1426,30 +1567,6 @@ def _iter_cells(para):
     for row in getattr(para, "rows", []) or []:
         for cell in row:
             yield cell
-
-
-def _resolve_refs(items: list[list]) -> None:
-    """把哨兵定位成真实字符偏移，记下每条引用的落点与显示文字。
-
-    分两趟的原因：解析一个块的时候还不知道整篇有哪些 id（注释块可能排在
-    引用之后），所以先记哨兵、整篇解析完再定。
-
-    本文档里有落点的引用直接定下来；没有落点的**先保留**（note 段开头的
-    反向链接除外 —— 那是注释自己的编号，正文那边已经有指过来的链接了）。
-    跨文件的落点要靠全书锚点表才能判，见 _finalize_refs。
-
-    表格要单独走一遍：格内的哨兵收在 cell["text"] 里、引用收在
-    cell["refs"] 里，跟段落的 item[1]/item[3] 不是同一处。
-    """
-    for item in items:
-        if item[0] == "text" and len(item) >= 4:
-            item[1], item[3] = _resolve_sentinels(item[1], item[3], item[2] == "note")
-        elif item[0] == "table":
-            for row in item[1]:
-                for cell in row:
-                    cell["text"], cell["refs"] = _resolve_sentinels(
-                        cell["text"], cell["refs"], False
-                    )
 
 
 def _iter_paragraphs(book):
@@ -1768,7 +1885,7 @@ def _parse_doc(data: bytes, key=None) -> list[list]:
     items = parser.items
     if key is not None:
         _namespace_items(items, key)
-    _resolve_refs(items)
+    _resolve_refs(items, parser._ruby)
     return items
 
 
@@ -2289,12 +2406,14 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             if item[0] == "text":
                 refs = item[3] if len(item) > 3 else []
+                ruby = item[4] if len(item) > 4 else []
                 current.append(
                     Paragraph(
                         text=item[1],
                         kind=item[2],
                         anchor=pending_anchor,
                         refs=refs,
+                        ruby=ruby,
                     )
                 )
                 pending_anchor = ""

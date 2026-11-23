@@ -395,6 +395,7 @@ def _para_lines(para: Paragraph) -> list[tuple[str, Paragraph | None]]:
     """
     raw = _sanitize("" if para.text is None else str(para.text))
     refs = [r for r in (getattr(para, "refs", None) or []) if isinstance(r, dict)]
+    ruby = [r for r in (getattr(para, "ruby", None) or []) if isinstance(r, dict)]
     anchor = _text_of(getattr(para, "anchor", ""))
     lines = raw.splitlines() or [""]
     out: list[tuple[str, Paragraph | None]] = []
@@ -420,11 +421,32 @@ def _para_lines(para: Paragraph) -> list[tuple[str, Paragraph | None]]:
                 # 落在被 strip 掉的那截空白里（行首缩进、行尾空格）就贴到边上：
                 # "插在段末空格之后"与"插在最后一个字之后"是同一个位置。
                 own.append({**ref, "at": min(max(at - body_at, 0), len(text))})
-        if len(lines) == 1 and text == raw and own == refs:
+        # 注音是区间语义，换算规则比引用更严：base 必须**整段**落在 strip 后的
+        # 文字里。跨行的 base 没有"半个 ruby"这种写法，压到行内任何位置都是错位，
+        # 只能丢 —— 但它丢的只是读音，字还在正文里。
+        own_ruby: list[dict] = []
+        for rb in ruby:
+            try:
+                at = int(rb.get("at", -1))
+                length = int(rb.get("len", 0))
+            except (TypeError, ValueError):
+                continue
+            if at >= body_at and at + length <= body_at + len(text):
+                own_ruby.append({**rb, "at": at - body_at})
+        if len(lines) == 1 and text == raw and own == refs and own_ruby == ruby:
             out.append((text, para))
         else:
             out.append(
-                (text, replace(para, text=text, refs=own, anchor=anchor if index == 0 else ""))
+                (
+                    text,
+                    replace(
+                        para,
+                        text=text,
+                        refs=own,
+                        ruby=own_ruby,
+                        anchor=anchor if index == 0 else "",
+                    ),
+                )
             )
     return out
 
@@ -455,7 +477,33 @@ def _rendered_refs(para: Paragraph) -> list[dict]:
     return out
 
 
-def _inline_html(text: str, refs: list[dict], href_of=None, note_of=None) -> str:
+def _ruby_spans(text: str, ruby) -> list[tuple[int, int, str]]:
+    """把段落的 ruby 字段收成可渲染的区间 `[(start, end, rt)]`。
+
+    归一（排序、去重叠、rt 非空）在 `model._normalize_ruby` 里做过一次，
+    这里只补它判不了的那件事：区间是不是真的落在 `text` 之内。越界的一律
+    **跳过**而不是钳制 —— 钳制会把读音盖到别的字上，读者看到「梦泽AYA文哉」
+    这种错位，比不渲更糟。
+    """
+    out: list[tuple[int, int, str]] = []
+    last_end = 0
+    for r in ruby or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            at = int(r.get("at", -1))
+            length = int(r.get("len", 0))
+        except (TypeError, ValueError):
+            continue
+        rt = _text_of(r.get("rt"))
+        if at < last_end or length <= 0 or at + length > len(text) or not rt:
+            continue
+        out.append((at, at + length, rt))
+        last_end = at + length
+    return out
+
+
+def _inline_refs(text: str, refs: list[dict], href_of=None, note_of=None) -> str:
     """把一段文字渲成 HTML，行内引用（[1] 这类）按有没有注文分两条路：
 
     - **有注文**（引用自带 `text`，或 `note_of` 从全书注释表里查到落点）→ 渲成
@@ -510,6 +558,52 @@ def _inline_html(text: str, refs: list[dict], href_of=None, note_of=None) -> str
     return "".join(parts)
 
 
+def _inline_html(
+    text: str, refs: list[dict], href_of=None, note_of=None, ruby=None
+) -> str:
+    """一段文字的完整行内渲染：注音区间先切出来，剩下的交回 `_inline_refs`。
+
+    为什么要切而不是一次性扫：注音是**区间**语义（覆盖 text[at:at+len]），
+    引用是**插入点**语义（插在第 at 字之前），两套坐标混在一个循环里，
+    边界条件会绕成"注音结尾正好等于注码位置"这种一格之差的 bug。切开之后
+    两边各用自己最自然的写法，偏移按段首平移即可。
+
+    落在注音区间内部的引用（`<ruby>文<a>〔1〕</a><rt>AYA</rt></ruby>`）没有
+    位置可插，统一挪到注音**之前**：宁可位置差一个词，也不把注码丢掉 ——
+    丢掉之后它指向的注文会被当成"没人要"整条清走。
+    """
+    spans = _ruby_spans(text, ruby)
+    if not spans:
+        return _inline_refs(text, refs, href_of, note_of)
+
+    def _at(ref) -> int | None:
+        try:
+            return int(ref.get("at", 0))
+        except (TypeError, ValueError):
+            return None
+
+    parts: list[str] = []
+    pos = 0
+    for start, end, rt in spans:
+        head: list[dict] = []
+        for ref in refs:
+            at = _at(ref)
+            if at is None or not (pos <= at <= start):
+                continue
+            head.append({**ref, "at": max(0, at - pos)})
+        parts.append(_inline_refs(text[pos:start], head, href_of, note_of))
+        parts.append(f"<ruby>{_esc(text[start:end])}<rt>{_esc(rt)}</rt></ruby>")
+        pos = end
+    tail: list[dict] = []
+    for ref in refs:
+        at = _at(ref)
+        if at is None or at < pos:
+            continue
+        tail.append({**ref, "at": at - pos})
+    parts.append(_inline_refs(text[pos:], tail, href_of, note_of))
+    return "".join(parts)
+
+
 def _para_html(
     tag: str, text: str, para: "Paragraph | None", cls: str, href_of=None, note_of=None
 ) -> str:
@@ -526,7 +620,8 @@ def _para_html(
         if cls == "note":
             attrs += ' epub:type="footnote"'
     refs = list(getattr(para, "refs", []) or []) if para is not None else []
-    return f"<{tag}{attrs}>{_inline_html(text, refs, href_of, note_of)}</{tag}>\n"
+    ruby = list(getattr(para, "ruby", []) or []) if para is not None else []
+    return f"<{tag}{attrs}>{_inline_html(text, refs, href_of, note_of, ruby)}</{tag}>\n"
 
 
 def _render_paragraphs(

@@ -2933,6 +2933,69 @@ def case_cover_page_dropped_like_toc() -> None:
     assert book.author == "某作者", book.author
 
 
+def case_chapter_leading_blank_lines_are_not_front_matter() -> None:
+    """章首页首的版式留白不许变成「前附」白页。
+
+    实测《象首迷宫》：序章页在标题上方垫了三行空占位（两个空 <p>、一行全角
+    空格 + <br/>），目录给「序章」定位时落在标题那一项，前三项就被当成
+    "第一章之前的内容"推进 front_matter；打包器据此合成一条只剩 h1 的
+    「前附」卷，读者点开一片空白。
+
+    判据：这批前置内容里一句能看见的字都没有（只剩空行与跟着空行的锚点），
+    就整批丢掉；掐头掐尾的空行一起收掉 —— 它们属于版式留白，不是书前内容。
+    真有字的前置内容照旧进 front_matter，一个字都不许少。
+    """
+    docs = [("序章", "ch1"), ("第一章 开端", "ch2")]
+    padding = "<p></p><p></p><p>　　<br /></p>"
+    # 目录锚点落在标题之上（源书就是这样：mokuji-0001 挂在序章标题前），
+    # 这样"标题之前"的几项才会被当成前置内容推出去。
+    anchor = '<span id="mokuji-0001"></span>'
+
+    def _import(head: str):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            entries = {
+                "OEBPS/content.opf": _opf(
+                    spine=[k for _, k in docs],
+                    manifest=[
+                        (k, f"Text/{k}.xhtml", "application/xhtml+xml", "")
+                        for _, k in docs
+                    ]
+                    + [("ncx", "toc.ncx", "application/x-dtbncx+xml", "")],
+                ),
+                "OEBPS/toc.ncx": _ncx(
+                    _navpoint("序章", "Text/ch1.xhtml#mokuji-0001")
+                    + _navpoint("第一章 开端", "Text/ch2.xhtml")
+                ),
+                "OEBPS/Text/ch1.xhtml": XHTML.format(
+                    body=f"{head}{anchor}<h1>序章</h1><p>正文第一段。</p>"
+                ),
+                "OEBPS/Text/ch2.xhtml": XHTML.format(
+                    body="<h1>第一章 开端</h1><p>正文第二段。</p>"
+                ),
+            }
+            return read_epub_with_report(_epub(tmp, entries))
+
+    imp = _import(padding)
+    book = imp.book
+    assert [ch.title for ch in book.chapters] == ["序章", "第一章 开端"], [
+        ch.title for ch in book.chapters
+    ]
+    assert book.front_matter == [], [p.text for p in book.front_matter]
+    assert imp.report["front_matter_paragraphs"] == 0, imp.report
+    # 序章自己从正文开始，空行也不许留在首段
+    assert [p.text for p in book.chapters[0].paragraphs] == ["正文第一段。"], [
+        (p.kind, p.text) for p in book.chapters[0].paragraphs
+    ]
+
+    # 真有字的前置内容照旧是书前内容：只掐空行，一个字都不许少
+    imp2 = _import("<p>版权声明一句。</p>" + padding)
+    assert [p.text for p in imp2.book.front_matter] == ["版权声明一句。"], [
+        (p.kind, p.text) for p in imp2.book.front_matter
+    ]
+    assert imp2.report["front_matter_paragraphs"] == 1, imp2.report
+
+
 def case_book_title_not_front_word() -> None:
     """「书名」不再算前附词：书名页由 _is_cover_page 整页丢弃。
 
@@ -3051,6 +3114,7 @@ def main() -> int:
         case_epub2_basic_split,
         case_front_entries_keep_titles_and_chapter_boundaries,
         case_cover_page_dropped_like_toc,
+        case_chapter_leading_blank_lines_are_not_front_matter,
         case_book_title_not_front_word,
         case_front_entry_with_children_becomes_volume,
         case_leading_body_title_echo_is_dropped,

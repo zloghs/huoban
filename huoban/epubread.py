@@ -2028,6 +2028,35 @@ def _split_positions(items: list[list], nodes: list[_NavNode], key=None) -> list
     return [int(p or 0) for p in pos]
 
 
+def _strip_layout_padding(items: list[list]) -> list[list]:
+    """掐掉首尾的版式留白；整批只剩空行时返回空表。
+
+    日式排版的章首页爱在标题上方垫两三行空 `<p>`（有的还挂一个目录锚点），
+    `<p>　　<br /></p>` 这种"全角空格 + 换行"也算一行。目录给这一页定位时落到
+    锚点或标题那一项，标题之前的几项就被当成"书前内容"推给 front —— 书前多出
+    几个空段，打包器据此造出一条只剩标题的「前附」卷，读者点开是白页（实测
+    《象首迷宫》的序章页首）。
+
+    只处理"第一批前置内容"：中间夹着正文时一个字都不动，锚点跟着后面的正文
+    块走。整批只剩空行与锚点时判成"没有内容"，返回空表 —— 调用方据此跳过，
+    front 不会被空行点亮。
+    """
+    def _is_padding(item: list) -> bool:
+        # 只有空行算留白。sep 是分隔线：文本可能也是空的（<hr> 没有字），
+        # 但它是个元素，不许当空行掐掉。
+        return item[0] == "text" and not item[1].strip() and item[2] != "sep"
+
+    start, end = 0, len(items)
+    while start < end and _is_padding(items[start]):
+        start += 1
+    while end > start and _is_padding(items[end - 1]):
+        end -= 1
+    rest = items[start:end]
+    if not rest or all(item[0] == "anchor" for item in rest):
+        return []
+    return rest
+
+
 def _drop_duplicate_heading(items: list[list], title: str) -> tuple[list[list], list]:
     """去掉章节开头那个"和目录标题重复"的标题块，返回 (剩下的块, 被删块的注码)。
 
@@ -2670,11 +2699,20 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                     continue
                 # 目录里没有的文档：续接到当前章节（分片续页）或前言。
                 continuation_docs += 1
-                _emit(items)
+                body = items if chapters_started else _strip_layout_padding(items)
+                if body:
+                    _emit(body)
                 continue
             positions = _split_positions(items, nodes, _doc_key(name, resolve))
             if positions and positions[0] > 0:
-                _emit(items[: positions[0]])
+                head = items[: positions[0]]
+                if not chapters_started:
+                    # 第一章还没切出来：标题之前的这几项先按"版式留白"过一遍，
+                    # 别让几个空行把 front 点亮成一条空白「前附」（见
+                    # _strip_layout_padding）。有字的前置内容照旧全数保留。
+                    head = _strip_layout_padding(head)
+                if head:
+                    _emit(head)
             for i, node in enumerate(nodes):
                 end = positions[i + 1] if i + 1 < len(nodes) else len(items)
                 seg = items[positions[i]:end]

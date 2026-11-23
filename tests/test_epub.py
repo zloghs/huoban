@@ -914,6 +914,33 @@ def case_no_front_matter_means_no_front_volume() -> None:
     assert hrefs == ["Text/chap0001.xhtml", "Text/chap0002.xhtml"], hrefs
 
 
+def case_blank_front_matter_produces_no_volume() -> None:
+    """front_matter 里全是空行时，不许造一条只剩标题的「前附」白页。
+
+    实测《象首迷宫》：序章页首垫了三行版式留白（两个空 <p>、一行全角空格 +
+    <br/>），导入端把它们当成了书前内容。前附的判据若只看"表非空"，就会造出
+    一条 h1 之外什么都没有的卷 —— 读者点开是白页（用户报的就是这一页）。
+    空行不是内容：一句能看见的字都没有时，这一卷不许出现。
+    """
+    book = _book(
+        _chapter("第一章", ["甲。"]),
+        _chapter("第二章", ["乙。"]),
+        front=[
+            Paragraph(text="", kind="blank"),
+            Paragraph(text="", kind="blank"),
+            Paragraph(text="", kind="blank"),
+        ],
+    )
+    result = _build(book)
+
+    titles = [li.find(".//xhtml:a", NS).text for li in _nav_lis(result)]
+    assert titles == ["第一章", "第二章"], titles
+    assert len(_chapter_roots(result)) == 2, _chapter_roots(result)
+    # 空行也不许折进第一章：渲染时会掐掉，但文件里连空 <p> 都不该多出来
+    first = _chapter_roots(result)[0]
+    assert _paras(first) == ["甲。"], _paras(first)
+
+
 def case_no_chapters_with_front_matter_still_works() -> None:
     """0 章兜底不许破：全书没有章节时，前言后记仍要合成一页 chap0001。
 
@@ -1755,6 +1782,7 @@ def main() -> int:
         case_front_tail_matter,
         # 0.4.0 前附（卷）：书前内容独立成页 + 目录独立一条
         case_no_front_matter_means_no_front_volume,
+        case_blank_front_matter_produces_no_volume,
         case_no_chapters_with_front_matter_still_works,
         case_front_volume_does_not_swallow_chapters,
         case_tail_matter_still_folds_into_last_chapter,

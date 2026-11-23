@@ -1020,6 +1020,21 @@ def _level_of(ch: Chapter, where: str, warnings: list[str]) -> int:
 FRONT_MATTER_TITLE = "前附"
 
 
+def _has_visible_content(paragraphs) -> bool:
+    """这些段落里有没有读者能看见的东西：字、图、表格、分隔线。
+
+    不能只判"表非空"：`blank` 段也算一段，导入端会把章首页首的版式留行存成
+    blank，一页全是空行时表是满的、页却是白的（《象首迷宫》的「前附」就是
+    这么来的）。空 body 段同样不算 —— 渲染时会被折叠掉。
+    """
+    for p in paragraphs:
+        if _text_of(getattr(p, "text", "")):
+            return True
+        if _text_of(getattr(p, "kind", "")) in ("image", "table", "sep"):
+            return True
+    return False
+
+
 def _front_matter_chapter(book: Book) -> Chapter | None:
     """把书前剩下的零散内容包成一条 level=2 的「前附（卷）」；没有就返回 None。
 
@@ -1039,6 +1054,10 @@ def _front_matter_chapter(book: Book) -> Chapter | None:
         # 没有书前内容 → 不出现这一条（不许凭空多一条空的前附）。
         # 没有章节 → 走 _render_chapters 里"全书只有前言后记"的既有兜底，
         # 那条路把 front+tail 合成 chap0001，不能让前附把它顶掉。
+        return None
+    if not _has_visible_content(book.front_matter):
+        # 只有空行也算没有内容：导入端会把章首页首的版式留白存成 blank，
+        # 只看"表非空"就会造出一条 h1 之外什么都没有的卷，读者点开是白页。
         return None
     return Chapter(
         title=FRONT_MATTER_TITLE,

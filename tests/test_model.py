@@ -368,17 +368,41 @@ def case_save_load_identical() -> None:
     assert p2.read_text(encoding="utf-8") == text1, "读回再写出，文件内容不一致"
 
 
+def case_align_roundtrip() -> None:
+    """align 只在该段真靠右时写盘；老树不产生这个键；认不出的值归空。
+
+    为什么非法值不报错而是归空：手改 JSON 写错一个词（"Center"）不该让整本
+    书打不出来，但也不能放它进 xhtml 变成一个凭空出现的 class。
+    """
+    book = _sample_book()
+    book.chapters[1].paragraphs[0].align = "right"
+    raw = to_dict(book)
+    para = raw["chapters"][1]["paragraphs"][0]
+    assert para["align"] == "right", para
+    assert to_dict(from_dict(raw)) == raw
+
+    # 老树（没有这个键）重新序列化后不该凭空多出一个空串键
+    plain = to_dict(_sample_book())
+    assert all("align" not in p for p in plain["chapters"][1]["paragraphs"])
+
+    para["align"] = "Center"
+    assert from_dict(raw).chapters[1].paragraphs[0].align == ""
+    para["align"] = ""
+    assert "align" not in to_dict(from_dict(raw))["chapters"][1]["paragraphs"][0]
+
+
 def case_version_guard() -> None:
     """主版本号不认识时必须报错，不能按旧语义读出一本错位的书。
 
     v2 相对 v1 只是 Paragraph 多了三个默认字段（image 段专用），v3 相对 v2
     只多一个 rows（table 段专用），v4 增加 refs[].text，v5 增加 Chapter.refs，
-    v6 增加可选目录深度。旧文件按新版本读入都无损；其余主版本仍然拒绝。
+    v6 增加可选目录深度，v7 增加 ruby，v8 增加 align。旧文件按新版本读入
+    都无损；其余主版本仍然拒绝。
     """
-    for good in ("1", "2", "3", "4", "5", "6", "7", "7.0", "1.5.9-rc"):
+    for good in ("1", "2", "3", "4", "5", "6", "7", "8", "8.0", "1.5.9-rc"):
         ok = from_dict({"version": good, "chapters": []})
         assert isinstance(ok, Book), good
-    for bad in ("0", "8", "9.0"):
+    for bad in ("0", "9", "9.0"):
         try:
             from_dict({"version": bad, "chapters": []})
         except ValueError:
@@ -630,6 +654,7 @@ def main() -> int:
         case_stats,
         case_save_load_identical,
         case_version_guard,
+        case_align_roundtrip,
         case_toc_depth_roundtrip,
         case_table_rows_roundtrip,
         case_validate_table,

@@ -3162,6 +3162,77 @@ def case_front_entry_with_children_becomes_volume() -> None:
     assert guide_kids == ["作者生平述要", "作品的出版与接受"], guide_kids
 
 
+def case_right_aligned_css_class_becomes_align() -> None:
+    """原书 CSS 声明 text-align:right 的类 → 段落 align="right"（落款/日期/署名）。
+
+    只认**单类选择器**：后代选择器判不了（要先拼祖先链），同一个类又被别的
+    规则改成非靠右时整类不认 —— 错排一段靠右是读者一眼看得见的错，漏排
+    只是版式差一点。标题/注文即使 class 命中也不带 align：它们各有自己的排版。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        css = """
+        p.luokuan { text-align: right; }
+        .right-info { text-align: right !important; }
+        .tail { text-align: end; }
+        .both { text-align: right; }
+        .both { text-align: left; }
+        .wrap .inner { text-align: right; }
+        """
+        opf = _opf(
+            spine=["c1", "c2"],
+            manifest=[
+                ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                ("c2", "Text/ch2.xhtml", "application/xhtml+xml", ""),
+                ("css", "Styles/main.css", "text/css", ""),
+                ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+            ],
+        )
+        ncx = _ncx(
+            _navpoint("第一章 落款", "Text/ch1.xhtml")
+            + _navpoint("第二章 内联", "Text/ch2.xhtml")
+        )
+        entries = {
+            "OEBPS/content.opf": opf,
+            "OEBPS/toc.ncx": ncx,
+            "OEBPS/Styles/main.css": css,
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body=(
+                    "<h1>第一章 落款</h1>"
+                    '<p class="luokuan">张三</p>'
+                    '<p class="right-info">二〇二六年十一月</p>'
+                    '<p class="tail">终</p>'
+                    '<p class="both">被改成左对齐的类</p>'
+                    '<p class="inner">后代选择器里的类</p>'
+                    '<p class="luokuan" epub:type="footnote">注文不该靠右</p>'
+                    "<p>普通正文。</p>"
+                )
+            ),
+            # 有的书把样式表直接写在页面里，没有单独的 .css
+            "OEBPS/Text/ch2.xhtml": XHTML.format(
+                body=(
+                    "<h1>第二章 内联</h1>"
+                    "<style>.inline-r { text-align: right }</style>"
+                    '<p class="inline-r">页内样式表里的落款</p>'
+                )
+            ),
+        }
+        book = read_epub(_epub(tmp, entries))
+        by_text = {p.text: p for ch in book.chapters for p in ch.paragraphs}
+        assert by_text["张三"].align == "right", by_text["张三"]
+        # !important 只影响优先级，不影响"这是靠右"这个事实
+        assert by_text["二〇二六年十一月"].align == "right"
+        # end 是逻辑值：横排下等于靠右
+        assert by_text["终"].align == "right"
+        assert by_text["被改成左对齐的类"].align == "", "同类被改成左对齐时应整类不认"
+        assert by_text["后代选择器里的类"].align == "", "后代选择器判不了，宁可不认"
+        assert by_text["普通正文。"].align == ""
+        assert by_text["页内样式表里的落款"].align == "right", "页面 <style> 里的规则也要认"
+        note = by_text["注文不该靠右"]
+        assert note.kind == "note", note.kind
+        assert note.align == "", "注文即使 class 命中也不该被标成靠右"
+
+
 def main() -> int:
     cases = [
         case_epub2_basic_split,
@@ -3223,6 +3294,7 @@ def main() -> int:
         case_spine_non_xhtml_not_silent,
         case_cli_reflow_output_collisions,
         case_cli_reflow_redact_hides_paths_and_errors,
+        case_right_aligned_css_class_becomes_align,
     ]
     failed = 0
     for c in cases:

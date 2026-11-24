@@ -1754,6 +1754,45 @@ def case_explicit_toc_depth() -> None:
     assert depth.get("content") == "3", depth.attrib
 
 
+def case_right_aligned_paragraph_gets_own_class() -> None:
+    """align="right" 的正文段渲成 p.align-right（靠右、不缩进），别的段不受影响。
+
+    来源：原书用 `p.luokuan { text-align: right }` 排落款/日期/署名
+    （导入侧见 test_epubread 的同名用例）。重排后正文一律两端对齐 + 首行缩进，
+    不单独给一个样式，落款会顶到左边、被当成正文的最后一句。
+    """
+    book = _book(
+        _chapter("第一章", [
+            Paragraph(text="正文一。"),
+            Paragraph(text="张三", align="right"),
+        ]),
+        front=[Paragraph(text="某某出版社", align="right")],
+    )
+    result = _build(book)
+    # roots[0] 是「前附」卷（前言单独成卷），第一章在 roots[1]
+    root = _chapter_roots(result)[1]
+    by_text = {p.text: p for p in root.findall(".//xhtml:p", NS)}
+    assert by_text["张三"].get("class") == "align-right", by_text["张三"].get("class")
+    assert by_text["正文一。"].get("class") in (None, ""), "正文段不该被牵连"
+
+    # 前言里的短行即使符合"书名页样式"，原书说了靠右就按靠右排
+    front_root = _chapter_roots(result)[0]
+    front_p = [
+        p for p in front_root.findall(".//xhtml:p", NS)
+        if (p.text or "") == "某某出版社"
+    ]
+    assert front_p, "前言段没渲出来"
+    assert front_p[0].get("class") == "align-right", front_p[0].get("class")
+
+    css = _text(result, "OEBPS/Styles/main.css")
+    block = re.search(r"p\.align-right\s*\{([^}]*)\}", css)
+    assert block, "样式表里必须有 p.align-right 规则"
+    decls = block.group(1)
+    assert re.search(r"text-align:\s*right", decls), decls
+    # 继承 p 的 2em 首行缩进会让靠右的落款右边短两格，必须显式归零
+    assert re.search(r"text-indent:\s*0", decls), decls
+
+
 def main() -> int:
     cases = [
         case_package_structure,
@@ -1813,6 +1852,7 @@ def main() -> int:
         # 用户反馈（2026-11-09）：诗词块行距 / 字体子集收前言
         case_verse_gap_absorbed,
         case_table_renders_as_table,
+        case_right_aligned_paragraph_gets_own_class,
         case_font_subset_includes_front_matter,
     ]
     failed = 0

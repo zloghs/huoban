@@ -756,6 +756,56 @@ _CLASS_KINDS = {
     "separator": "sep",
 }
 
+# ---------- 原书样式表："这段靠右排" ----------
+
+# 真实样本（《占星术杀人魔法》的 .luokuan/.luokuan-x、《谁的问题》的 .right-info）
+# 把落款、日期、署名写成 `<p class="luokuan">` + `p.luokuan { text-align: right }`。
+# 重排后正文一律两端对齐 + 2em 首行缩进，这些段落会顶到左边，读者分不清
+# "作者落款"和"正文的最后一句"。所以要把这个版式意图搬进章节树
+# （Paragraph.align，见 model.py），打包时换成自己的 p.align-right。
+#
+# 只认**单类选择器**（`.foo` 或 `p.foo`）：
+# - 后代/子选择器（`.a .b`、`.a > .b`）、多类（`.a.b`）判不了 —— 段落上写着
+#   class="a b" 时到底命中哪条规则，要先拼出祖先链、再算特异性，那是浏览器的
+#   活；按单类硬猜会把 `.content .note` 这种布局规则当成段落本身的样式；
+# - 伪类、属性选择器同理跳过；
+# - 标签级规则（`p { text-align: right }`）不认：那是整本书靠右，更像排版事故
+#   （版权页、目录页常这么写），按正文排反而安全。
+_CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+_CSS_ALIGN = re.compile(r"text-align\s*:\s*([a-zA-Z-]+)", re.I)
+_CSS_SINGLE_CLASS = re.compile(r"^(?:[a-zA-Z][\w:-]*)?\.([-\w]+)$")
+_CSS_STYLE_BLOCK = re.compile(r"<style[^>]*>(.*?)</style>", re.S | re.I)
+
+
+def _right_aligned_classes(css_texts: list[str]) -> set[str]:
+    """扫样式表，返回"声明为靠右排"的类名集合。
+
+    同一个类在别的规则里被改成非靠右（`.x{text-align:right}` 之后又有
+    `.x{text-align:center}`）时整个类不认：层叠要靠特异性与出现顺序才算得准，
+    这里只做单类这一层，判不清就以"不靠右"为准 —— 少排一段右对齐只是版式
+    差一点，把正文整段排错边是读者一眼就看得见的错。
+
+    值的白名单是 right / end：`end` 是逻辑值，竖排书里等于靠"行尾"，
+    横排下与 right 同义（《象首迷宫》这类台湾竖排书会这么写）。
+    """
+    right: set[str] = set()
+    other: set[str] = set()
+    for css in css_texts:
+        text = _CSS_COMMENT.sub("", css or "")
+        for rule in _CSS_RULE.finditer(text):
+            m = _CSS_ALIGN.search(rule.group(2))
+            if m is None:
+                continue
+            value = m.group(1).strip().lower()
+            target = right if value in ("right", "end") else other
+            for part in rule.group(1).split(","):
+                hit = _CSS_SINGLE_CLASS.match(part.strip())
+                if hit:
+                    target.add(hit.group(1).lower())
+    return right - other
+
+
 # 自家信息页的指纹（书名/作者/来源/章节数/生成时间/由谁生成）。重排时整页跳过：
 # 那是打包器自己写的元数据，不是书的内容；不跳过的话每过一遍重排就多出一段
 # "章节数：N"，重排几遍书里就攒一堆自家统计数字。
@@ -884,19 +934,26 @@ class _DocParser(html.parser.HTMLParser):
     - ["text", text, kind]      一个块级元素归一后的文字
     - ["image", src, caption]   一张图（src 还是相对路径，调用方 resolve）
 
-    带行内引用的文本块多一个第四项：`["text", text, kind, refs]`，
-    refs 是 `[(哨兵号, 目标 id, 显示文字)]`，text 里仍留着 `\\x01N\\x02` 哨兵，
-    由 _resolve_refs 在整篇解析完之后统一定位、去掉哨兵。
+    文本块后面可以跟三个附加项，下标固定（再加新的就顺延到 6）：
+    - item[3] refs：`[(哨兵号, 目标 id, 显示文字)]`，text 里仍留着 `\\x01N\\x02`
+      哨兵，由 _resolve_refs 在整篇解析完之后统一定位、去掉哨兵。
+    - item[4] ruby：注音表（seq → 读音），_resolve_refs 换成 `[{at, len, rt}]`。
+    - item[5] align：`"right"`，原书 CSS 把这一段声明成 text-align:right
+      （落款/日期/署名，见 _right_aligned_classes）。
+    靠后的项出现时，前面缺的用空列表占位，所以按下标取永远不会串位。
 
     为什么用 html.parser 而不是 ElementTree：真实 EPUB 大量不规范
     （未闭合的 <p>、&nbsp;、重复属性、大小写混乱），ElementTree 直接
     ParseError；html.parser 是容错的，坏文档也能尽量抠出内容。
     """
 
-    def __init__(self, key=None) -> None:
+    def __init__(self, key=None, align_classes=None) -> None:
         super().__init__(convert_charrefs=True)
         # 引用目标 → 全书唯一键。None 时按"只取片段名"处理（单篇解析的旧行为）。
         self._key = key or (lambda href: href.split("#", 1)[1].strip() if "#" in href else "")
+        # 原书样式表里声明为靠右的类名（见 _right_aligned_classes）。
+        # 单个文档解析时默认空集合：不给样式表就谁都不靠右，不会凭 class 名字猜。
+        self._align_classes = frozenset(align_classes or ())
         self.items: list[list] = []
         # 每帧：[tag, attrs, 文本缓冲, 有子块, 有图, 行内引用, 是注释容器]
         self._frames: list[list] = []
@@ -1067,6 +1124,13 @@ class _DocParser(html.parser.HTMLParser):
         item = ["text", text, kind]
         if refs:
             item.append(refs)
+        # 原书把这一段声明成靠右（落款/日期/署名）：记进 item[5]，交给 _import
+        # 落进 Paragraph.align。只有正文段（body）收这个标记 —— 标题、
+        # 注文、诗词各有自己的排版，靠右会把那几种样式整个顶掉。
+        if kind == "body" and any(w in self._align_classes for w in cls.split()):
+            while len(item) < 5:  # 占住 refs / ruby 两个位置，align 固定在下标 5
+                item.append([])
+            item.append("right")
         self.items.append(item)
         self.text_since_image = True
 
@@ -1896,8 +1960,8 @@ def _localize_anchors(book) -> None:
         fix_refs(getattr(ch, "refs", None))
 
 
-def _parse_doc(data: bytes, key=None) -> list[list]:
-    parser = _DocParser(key)
+def _parse_doc(data: bytes, key=None, align_classes=None) -> list[list]:
+    parser = _DocParser(key, align_classes)
     parser.feed(data.decode("utf-8", "replace"))
     parser.close()
     items = parser.items
@@ -2359,6 +2423,9 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
     # --- 第一遍：统计图片引用（装饰图/孤儿图判定要用全书计数） ---
     img_refs: Counter[str] = Counter()
     css_refs: Counter[str] = Counter()
+    # 全书样式表的原文（manifest 里的 .css 与文档内联 <style> 都算）。
+    # 用来找"哪些类被声明成靠右"，见 _right_aligned_classes。
+    css_texts: list[str] = []
     img_re = re.compile(
         r"""(?:src|data-src|xlink:href|href)\s*=\s*["']([^"']+)["']""", re.I
     )
@@ -2372,6 +2439,10 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
         except KeyError:
             continue
         text = data.decode("utf-8", "replace")
+        for m in _CSS_STYLE_BLOCK.finditer(text):
+            # 有些书把样式表直接写在页面的 <style> 里（没有单独的 .css），
+            # 只扫 manifest 里的 text/css 会漏掉这一批。
+            css_texts.append(m.group(1))
         for m in img_re.finditer(text):
             target = _resolve_ref(m.group(1), posixpath.dirname(name), resolve)
             if target and target.lower().endswith(IMAGE_EXTS):
@@ -2396,10 +2467,15 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
             css_text = zf.read(css_name).decode("utf-8", "replace")
         except (KeyError, UnicodeDecodeError):
             continue
+        css_texts.append(css_text)
         for m in re.finditer(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", css_text, re.I):
             target = _resolve_ref(m.group(1), posixpath.dirname(css_name), resolve)
             if target and target.lower().endswith(IMAGE_EXTS):
                 css_refs[target] += 1
+
+    # 靠右排的类（落款/日期/署名）。重排后正文一律两端对齐 + 首行缩进，
+    # 这类段落要靠这一份名单单独标出来（见 _right_aligned_classes）。
+    align_classes = _right_aligned_classes(css_texts)
 
     manifest_images = {
         resolved
@@ -2461,6 +2537,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                         anchor=pending_anchor,
                         refs=refs,
                         ruby=ruby,
+                        align=item[5] if len(item) > 5 else "",
                     )
                 )
                 pending_anchor = ""
@@ -2674,7 +2751,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve), align_classes)
             except KeyError:
                 continue
             if _is_generated_page(items):
@@ -2703,7 +2780,7 @@ def _import(zf: zipfile.ZipFile, src: Path, image_dir) -> EpubImport:
                 continue
             doc_dir[0] = posixpath.dirname(name)
             try:
-                items = _parse_doc(zf.read(name), _doc_key(name, resolve))
+                items = _parse_doc(zf.read(name), _doc_key(name, resolve), align_classes)
             except KeyError:
                 continue
             nodes = nodes_by_doc.get(name, [])

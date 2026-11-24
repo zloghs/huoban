@@ -604,6 +604,19 @@ def _inline_html(
     return "".join(parts)
 
 
+def _right_aligned(para: "Paragraph | None") -> bool:
+    """这一段是不是原书声明为靠右排（落款、日期、署名）？
+
+    只认 body：heading/note/verse 各有自己的排版，靠右会把那几种样式整个顶掉
+    （导入时已不让它们带 align，这里再判一次是防手改 JSON）。
+    """
+    return (
+        para is not None
+        and _text_of(getattr(para, "kind", "")) == "body"
+        and _text_of(getattr(para, "align", "")) == "right"
+    )
+
+
 def _para_html(
     tag: str, text: str, para: "Paragraph | None", cls: str, href_of=None, note_of=None
 ) -> str:
@@ -808,12 +821,17 @@ def _render_paragraphs(
         # 书名页样式只套在正文段上：heading/note 有各自的语义样式，
         # 换成 .front-title 会让它们同时丢掉 .sub/.note 又匹配不到
         # p.front-title，退化成浏览器默认的又大又粗。
-        if front and kind == "body" and _is_title_page_line(text):
+        if front and kind == "body" and _is_title_page_line(text) and not _right_aligned(para):
             out.append(_para_html("p", text, para, "front-title", href_of, note_of))
             count += 1
             i += 1
             continue
         tag, cls = _ELEMENT_BY_KIND[kind]
+        # 原书把这一段声明成靠右（落款/日期/署名，见 epubread._right_aligned_classes）：
+        # 换成自己的 p.align-right。它要压过上面的书名页短行样式 ——
+        # "短行居中"只是没别的线索时的默认观感，原书明确说了靠右就以原书为准。
+        if _right_aligned(para):
+            cls = "align-right"
         out.append(_para_html(tag, text, para, cls, href_of, note_of))
         count += 1
         i += 1
@@ -1785,6 +1803,14 @@ p {
     /* 孤行控制：段首/段尾只剩一行落在页边时，宁可整段挪页也不留"寡妇行"。 */
     orphans: 2;
     widows: 2;
+}
+
+/* 靠右排的段落：原书写成 `p.luokuan { text-align: right }` 的落款、日期、署名
+   （见 epubread._right_aligned_classes）。缩进必须显式归零 —— 继承 p 的 2em
+   首行缩进后，靠右的落款右边会短两格，看着像没对到页边。 */
+p.align-right {
+    text-align: right;
+    text-indent: 0;
 }
 
 /* 章标题：居中、不缩进、不加粗（中文标题用楷体本身就够"轻"，

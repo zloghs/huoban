@@ -56,7 +56,14 @@ from .diagnose import cn_to_int, match_chapter, strip_frame
 #
 # v6 → v7（保留注音）：Paragraph 新增 ruby 字段，装段内的注音区间。
 # 同样**纯增量**：旧树没有这个键，读入后是空列表，重新序列化也不写它。
-SCHEMA_VERSION = "7"
+#
+# v7 → v8（右对齐段落）：Paragraph 新增 align 字段，记原书 CSS 里
+# `text-align: right` 的那一类段落（落款、日期、署名）。为什么单开一列而不新增
+# 一个 kind：kind 是"这段是什么"（标题/正文/注文），align 是"这段怎么排"，
+# 两者正交 —— 一段正文右对齐之后仍然是正文，字数统计、注标裁决、章节切分
+# 都还得按正文对待。同样**纯增量**：旧树没有这个键，读入后是空串，
+# 重新序列化也不写它。
+SCHEMA_VERSION = "8"
 
 # 段落类型。渲染层按这个决定排版，清洗层按这个标注，两边共用同一份取值。
 # verse = 诗词/韵文（词曰、诗云、右调·XXX 之类）：本质是"引文"，
@@ -69,6 +76,12 @@ SCHEMA_VERSION = "7"
 # 都只认 text —— 让它们各自再去遍历一遍网格，等于把"表格怎么摊平"这件事
 # 复制到四个地方，迟早长歪。
 PARAGRAPH_KINDS = ("body", "heading", "blank", "note", "verse", "sep", "image", "table")
+
+# 段落对齐方式（schema v8）：空串 = 不特殊处理（跟着 CSS 的 p 走，两端对齐 + 首行缩进），
+# "right" = 靠右、不缩进。只做右对齐一种 —— 真实样本里需要单独标出来的只有落款、
+# 日期、署名（原书写成 `p.right { text-align: right }`）；居中已有 heading/verse/sep
+# 各自的样式，左对齐就是正文，都不必再开一列。
+PARAGRAPH_ALIGNS = ("", "right")
 
 # 图片文件名允许的扩展名（与 epub.py 的 _IMAGE_TYPES 对齐）。
 # image 段的 text 必须满足：非空、纯文件名（不含 / \ 与 ..）、扩展名在此表内 ——
@@ -116,6 +129,13 @@ class Paragraph:
     # 清洗 TXT 那条线永远不写这个字段（TXT 表达不了行内注音），
     # to_dict 也只在非空时才写。
     ruby: list[dict] = field(default_factory=list)
+    # 这一段在**重排后**要不要靠右排（schema v8，EPUB 导入专用）：
+    # "" = 按正文样式（两端对齐、首行缩进），"right" = 靠右且不缩进。
+    # 来自原书 CSS：`p.right-info { text-align: right }` 这类单类规则命中本段
+    # class 时置 "right"（见 epubread._right_aligned_classes）。为什么要留下来：
+    # 落款、日期、署名靠右是作者的排版意图，按正文两端对齐会顶到左边，
+    # 读者会把它当成正文里的最后一句。清洗 TXT 那条线永远不写它。
+    align: str = ""
     # 以下字段只在 kind == "table" 时有意义（schema v3，EPUB 导入专用）：
     # 整张表的二维网格，rows[行][列] = 一个单元格 dict：
     #   {"text": 文字, "header": 是不是表头格（<th>）,
@@ -401,6 +421,17 @@ def _ruby_to_dict(item: dict) -> dict:
     return {"at": item["at"], "len": item["len"], "rt": item["rt"]}
 
 
+def _normalize_align(raw) -> str:
+    """把 JSON 里的 align 收敛到 PARAGRAPH_ALIGNS 之内。
+
+    不认识的值一律当"没标"：手改 JSON 写错一个词（"Right"、"center"）不该让
+    整本书打包失败，但也不能让它漏进 xhtml 变成一个凭空出现的 class。
+    大小写与首尾空白在这一处抹平，调用方按小写比较。
+    """
+    value = "" if raw is None else str(raw).strip().lower()
+    return value if value in PARAGRAPH_ALIGNS else ""
+
+
 def fit_refs(refs, text: str) -> list[dict]:
     """把行内引用的偏移收进 `text` 的长度之内，返回新列表。
 
@@ -536,6 +567,9 @@ def _paragraph_to_dict(p: Paragraph) -> dict:
     # 注音同理：只在这段真有注音时写，老树重新序列化后逐字节不变。
     if p.ruby:
         d["ruby"] = [_ruby_to_dict(r) for r in p.ruby]
+    # 对齐同理：只在这段真被标成右对齐时写。
+    if p.align:
+        d["align"] = p.align
     return d
 
 
@@ -560,6 +594,7 @@ def _paragraph_from_dict(raw) -> Paragraph:
         refs=_normalize_refs(raw.get("refs")),
         rows=normalize_rows(raw.get("rows")),
         ruby=_normalize_ruby(raw.get("ruby")),
+        align=_normalize_align(raw.get("align")),
     )
 
 
@@ -858,6 +893,13 @@ def validate_items(book: Book) -> list[dict]:
         # anchor / refs 会直接拼进 xhtml 的 id 与 href：脏值等于注入。
         if p.anchor and not _SAFE_ID.match(p.anchor):
             _add("bad_anchor", LEVEL_LAYOUT, f"{label}段落 anchor {p.anchor!r} 不是安全的 HTML id（含空白或引号等）")
+        # align 决定这一段套哪个 CSS 类（见 epub.py 的 p.align-right）：
+        # 契约外的取值渲染层只能当正文排，等于用户标好的靠右静默失效。
+        if p.align not in PARAGRAPH_ALIGNS:
+            _add("bad_align", LEVEL_LAYOUT,
+                f"{label}段落的 align={p.align!r} 不在白名单"
+                f"（只允许 right 或空串）：渲染层会退回正文样式"
+            )
         _check_refs(p.refs, p.text, label)
         if p.kind == "table":
             # 先归一再看：手写的章节树（测试、手改 JSON）里格子可能缺键，

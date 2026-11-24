@@ -1639,12 +1639,30 @@ def _finalize_refs(book) -> None:
     # 有注码指着它"；不转成 note，正文里点得开、注释区却还是普通正文。
     # 只认 at > 0 的引用：注释段开头那个注码是指回正文的反向链接（at == 0），
     # 拿它当判据会把整段正文转成注释 —— 实测一本来会多出 3000 多个假注释段。
-    referenced = {
-        r.get("note")
-        for para in _iter_paragraphs(book)
-        for r in list(para.refs or []) + [x for cell in _iter_cells(para) for x in cell.get("refs") or []]
-        if isinstance(r, dict) and isinstance(r.get("at"), int) and r["at"] > 0
-    }
+    def _pointing(refs) -> set:
+        """这批引用里"往外指"的落点。注释自己的回指（at == 0）不算。"""
+        return {
+            r.get("note")
+            for r in list(refs or [])
+            if isinstance(r, dict)
+            and isinstance(r.get("at"), int)
+            and not isinstance(r.get("at"), bool)
+            and r["at"] > 0
+            and r.get("note")
+        }
+
+    referenced = set()
+    for para in _iter_paragraphs(book):
+        referenced |= _pointing(para.refs)
+        for cell in _iter_cells(para):
+            referenced |= _pointing(cell.get("refs"))
+    # 标题注也要算：`<h1>AZOTH<a href="#a1">[1]</a></h1>` 指着的注文段，
+    # 除了这条注码没有第二个人指着它。漏了标题这一趟，它就停在普通正文里，
+    # 打包时找不到注文可写，标题上那个注码退化成点不开的死链接（实测
+    # 《占星术杀人魔法》AZOTH 那一章）。`_iter_anchor_keys`、
+    # `_drop_unreferenced_anchors` 早就补了这一趟，这里原本是同一处遗漏。
+    for ch in book.chapters:
+        referenced |= _pointing(getattr(ch, "refs", None))
     for para in _iter_paragraphs(book):
         if para.kind != "body" or not para.anchor or para.anchor not in referenced:
             continue

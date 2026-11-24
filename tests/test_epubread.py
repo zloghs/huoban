@@ -1394,6 +1394,59 @@ def case_title_note_stays_on_chapter() -> None:
         ], second.refs
 
 
+def case_title_note_marks_unlabelled_note_paragraph() -> None:
+    """只被标题注码指着的注文条目，也要翻成 note。
+
+    《占星术杀人魔法》的 AZOTH 那一章：
+
+        <h1>AZOTH<a href="#a1" id="b1"><span class="note">[1]</span></a></h1>
+        <p class="footnote"><a href="#b1" id="a1">[1]</a>AZOTH即“阿索德”。</p>
+
+    `footnote` 不在认得的 class 表里（只认 note / verse / sep），注文段唯一
+    的线索是"有注码指着它"。其余六条的注码都在正文里，顺利转了；唯独这一条
+    只被标题指着 —— 旧代码扫的 `referenced` 只走段落，标题注不在其中，于是
+    它停在 `body`，打包时找不到注文可写，标题上那个 [1] 退化成点不开的死链接。
+
+    `_iter_anchor_keys`、`_drop_unreferenced_anchors` 都补了标题注这一趟，
+    只有这里漏了；补上之后标题注与正文注同一口径（at > 0 才算"往外指"）。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        entries = {
+            "OEBPS/content.opf": _opf(
+                spine=["c1"],
+                manifest=[
+                    ("c1", "Text/ch1.xhtml", "application/xhtml+xml", ""),
+                    ("ncx", "toc.ncx", "application/x-dtbncx+xml", ""),
+                ],
+            ),
+            "OEBPS/toc.ncx": _ncx(_navpoint("AZOTH", "Text/ch1.xhtml")),
+            "OEBPS/Text/ch1.xhtml": XHTML.format(
+                body=(
+                    '<h1>AZOTH<a href="#a1" id="b1">'
+                    '<span class="note">[1]</span></a></h1>'
+                    "<p>正文第一段。</p>"
+                    '<p class="footnote"><a href="#b1" id="a1">[1]</a>'
+                    "AZOTH即“阿索德”。</p>"
+                )
+            ),
+        }
+        book = read_epub(_epub(tmp, entries))
+
+    ch = book.chapters[0]
+    # 1) 注文条目翻成 note，开头的回指编号剥掉
+    notes = [p for p in ch.paragraphs if p.kind == "note"]
+    assert [p.text for p in notes] == ["AZOTH即“阿索德”。"], [
+        (p.kind, p.text) for p in ch.paragraphs
+    ]
+    assert notes[0].anchor == "a1", notes[0].anchor
+    assert notes[0].refs == [], notes[0].refs
+    # 2) 标题上的注码原样留着，指向那条注文（偏移在标题文字之后）
+    assert [r["note"] for r in ch.refs] == ["a1"], ch.refs
+    assert ch.refs[0]["at"] == len("AZOTH"), ch.refs
+    assert ch.title == "AZOTH", ch.title
+
+
 def case_note_number_strip_only_foreign() -> None:
     """脚注编号剥离只对"别人的"脚注生效，且不许吃掉正文开头的数字。
 
@@ -3150,6 +3203,7 @@ def main() -> int:
         case_report_source_is_the_file_path,
         case_zhangyue_mark_is_not_a_picture,
         case_title_note_stays_on_chapter,
+        case_title_note_marks_unlabelled_note_paragraph,
         case_note_number_strip_only_foreign,
         case_calibre_noteref_and_rearnote,
         case_duokan_noteref_icon_keeps_ref,
